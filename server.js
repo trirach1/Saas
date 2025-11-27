@@ -1,97 +1,85 @@
 import express from "express";
-import makeWASocket, {
-  fetchLatestBaileysVersion,
+import {
+  default as makeWASocket,
   useMultiFileAuthState,
   DisconnectReason
 } from "@whiskeysockets/baileys";
-import path from "path";
-import { fileURLToPath } from "url";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+import fs from "fs";
+import path from "path";
+
 const app = express();
 app.use(express.json());
 
-const sessions = {}; // store active sessions
+const SESSIONS_DIR = "./sessions";
+if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR);
 
-// CREATE WA SESSION
-async function createSession(profile) {
-  console.log("Starting connection for profile:", profile);
+// Create WA Client
+async function createWhatsAppClient(profile, pairing = false) {
+  const sessionPath = path.join(SESSIONS_DIR, profile);
+  if (!fs.existsSync(sessionPath)) fs.mkdirSync(sessionPath);
 
-  const sessionDir = path.join(__dirname, "sessions", profile);
-  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+  const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
 
-  const { version } = await fetchLatestBaileysVersion();
+  console.log("Starting WA for profile:", profile);
 
   const sock = makeWASocket({
-    version,
     auth: state,
-    printQRInTerminal: true, // show QR in logs
+    printQRInTerminal: false,
+    browser: ["RAILWAY", "Chrome", "1.0"],
     syncFullHistory: false,
   });
 
   sock.ev.on("creds.update", saveCreds);
-  sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
-    if (qr) console.log("QR GENERATED:", qr);
 
-    if (connection === "open") {
-      console.log("WhatsApp connected:", profile);
+  sock.ev.on("connection.update", (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      console.log("QR GENERATED:", qr);
     }
 
     if (connection === "close") {
-      const shouldReconnect =
-        lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      const reason = lastDisconnect?.error?.output?.statusCode;
+      console.log("Connection closed:", reason);
 
-      console.log("connection closed, reconnect:", shouldReconnect);
+      if (reason !== DisconnectReason.loggedOut) {
+        createWhatsAppClient(profile);
+      }
+    }
 
-      if (shouldReconnect) createSession(profile);
-      else console.log("Logged out, session removed");
+    if (connection === "open") {
+      console.log("WA CONNECTED:", profile);
     }
   });
 
-  sessions[profile] = sock;
   return sock;
 }
 
-// API — INIT & GET QR
+// API: INIT
 app.post("/init", async (req, res) => {
   try {
-    const profile = req.body.profile;
-    if (!profile) return res.status(400).json({ error: "profile is required" });
+    const { profile, pairing } = req.body;
 
-    const sock = await createSession(profile);
+    if (!profile)
+      return res.status(400).json({ error: "profile is required" });
 
-    return res.json({
-      success: true,
-      message: "QR generated in logs",
-      profile,
-    });
-  } catch (e) {
-    console.error("INIT ERROR:", e);
-    res.status(500).json({ error: e.message });
+    console.log("INIT REQUEST:", profile);
+
+    await createWhatsAppClient(profile, pairing);
+
+    res.json({ success: true, profile });
+  } catch (err) {
+    console.error("INIT ERROR", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// API — SEND MESSAGE
-app.post("/send", async (req, res) => {
-  try {
-    const { profile, number, message } = req.body;
-
-    if (!sessions[profile])
-      return res.status(400).json({ error: "Profile session not initialized" });
-
-    const jid = number + "@s.whatsapp.net";
-    await sessions[profile].sendMessage(jid, { text: message });
-
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
 app.get("/", (req, res) => {
-  res.status(200).send("OK");
+  res.send("WhatsApp Baileys Service Running");
 });
 
-app.get("/health", (req, res) => {
-  res.status(200).json({ status: "healthy" });
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log("WhatsApp Railway Service running on port", PORT);
 });
-app.listen(8080, () => console.log("WhatsApp Railway Service running on port 8080"));
