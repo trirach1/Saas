@@ -1,89 +1,62 @@
-import express from "express";
-import cors from "cors";
-import fs from "fs";
-
-// Import Baileys in a SAFE WAY for all versions
-import * as baileys from "@whiskeysockets/baileys";
-
-const {
-  default: makeWASocket,
+import makeWASocket, {
   useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  DisconnectReason
-} = baileys;
+  DisconnectReason,
+  fetchLatestBaileysVersion
+} from '@whiskeysockets/baileys'
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+import express from 'express'
+import path from 'path'
+import fs from 'fs'
+import { fileURLToPath } from 'url'
 
-const PORT = process.env.PORT || 8080;
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-// Ensure sessions folder
-if (!fs.existsSync("./sessions")) {
-  fs.mkdirSync("./sessions");
-}
-
-const clients = {};
+const app = express()
+const PORT = process.env.PORT || 8080
 
 async function createWhatsAppClient(profileId) {
-  console.log("Starting connection for profile:", profileId);
+  console.log(`Starting connection for profile: ${profileId}`)
 
-  const { state, saveCreds } = await useMultiFileAuthState(
-    `./sessions/${profileId}`
-  );
+  const authDir = path.join(__dirname, 'auth', profileId)
+  const { state, saveCreds } = await useMultiFileAuthState(authDir)
 
-  const { version } = await fetchLatestBaileysVersion();
+  const { version } = await fetchLatestBaileysVersion()
 
   const sock = makeWASocket({
     version,
+    printQRInTerminal: true,
     auth: state,
-    printQRInTerminal: true
-  });
+    syncFullHistory: false
+  })
 
-  sock.ev.on("creds.update", saveCreds);
+  sock.ev.on('creds.update', saveCreds)
 
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update;
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect } = update
 
-    if (qr) {
-      console.log("QR CODE READY");
-      console.log(qr);
-    }
+    if (connection === 'close') {
+      const shouldReconnect =
+        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
 
-    if (connection === "open") {
-      console.log("Connected:", profileId);
-    }
-
-    if (connection === "close") {
-      const reason =
-        lastDisconnect?.error?.output?.statusCode ||
-        DisconnectReason.connectionClosed;
-
-      console.log("Connection closed:", reason);
-
-      if (reason !== DisconnectReason.loggedOut) {
-        console.log("Reconnecting...");
-        createWhatsAppClient(profileId);
+      if (shouldReconnect) {
+        createWhatsAppClient(profileId)
       }
     }
-  });
 
-  clients[profileId] = sock;
-  return sock;
+    if (update.qr) {
+      console.log("QR Code Received")
+    }
+
+    if (connection === 'open') {
+      console.log("WhatsApp Connected Successfully")
+    }
+  })
+
+  return sock
 }
 
-// API
-app.post("/init", async (req, res) => {
-  const { profileId } = req.body;
+createWhatsAppClient("b71df34e-d0b3-4281-9a5c-4ad767d91c12")
 
-  if (!profileId)
-    return res.status(400).json({ success: false, error: "profileId missing" });
-
-  if (!clients[profileId]) await createWhatsAppClient(profileId);
-
-  res.json({ success: true });
-});
-
-app.get("/health", (req, res) => res.send("OK"));
-
-app.listen(PORT, () => console.log("WhatsApp Railway Service running on port " + PORT));
+app.listen(PORT, () => {
+  console.log(`WhatsApp Railway Service running on port ${PORT}`)
+})
