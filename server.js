@@ -1,86 +1,109 @@
-import express from 'express';
-import cors from 'cors';
-import pkg from '@whiskeysockets/baileys';
-const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = pkg;
-import qrcode from 'qrcode';
-import fs from 'fs';
+import express from "express";
+import cors from "cors";
+import fetch from "node-fetch";
+import {
+  default as makeWASocket,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  DisconnectReason
+} from "@whiskeysockets/baileys";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+const clients = new Map();
 
-// ... createWhatsAppClient + initConnection code ...
+async function createWhatsAppClient(profileId, webhookUrl) {
+  const sessionPath = `./sessions/${profileId}`;
+  const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+  const { version } = await fetchLatestBaileysVersion();
 
-// API Routes
-app.post('/init', async (req, res) => {
-  try {
-    const { profileId, userId, usePairing } = req.body;
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: true,
+  });
 
-    if (!profileId || !userId) {
-      return res.status(400).json({
-        status: 'error',
-        error: 'Missing required fields'
-      });
+  sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("connection.update", async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      console.log("QR GENERATED for:", profileId);
+
+      webhookUrl &&
+        (await fetch(webhookUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            event: "qr",
+            profileId,
+            qr,
+          }),
+        }));
     }
 
-    console.log(`Initializing connection for ${profileId}`);
-    const result = await initConnection(profileId, userId, usePairing);
+    if (connection === "open") {
+      console.log("Connected:", profileId);
 
-    res.json(result);
-  } catch (error) {
-    console.error('Init endpoint error:', error);
-    res.status(500).json({
-      status: 'error',
-      error: error.message
+      webhookUrl &&
+        (await fetch(webhookUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            event: "connected",
+            profileId,
+          }),
+        }));
+    }
+
+    if (connection === "close") {
+      const shouldReconnect =
+        lastDisconnect?.error?.output?.statusCode !==
+        DisconnectReason.loggedOut;
+
+      console.log("Connection closed:", profileId, "Reconnect:", shouldReconnect);
+
+      if (shouldReconnect) createWhatsAppClient(profileId, webhookUrl);
+    }
+  });
+
+  return sock;
+}
+
+// INIT
+app.post("/init", async (req, res) => {
+  const { profileId, webhookUrl } = req.body;
+
+  if (!profileId)
+    return res.status(400).json({ success: false, error: "profileId required" });
+
+  if (clients.has(profileId))
+    return res.json({
+      success: true,
+      message: "Already initialized",
     });
-  }
+
+  const client = await createWhatsAppClient(profileId, webhookUrl);
+  clients.set(profileId, client);
+
+  res.json({ success: true, message: "Client initialized" });
 });
 
-app.post('/disconnect', async (req, res) => {
-  try {
-    const { profileId } = req.body;
-
-    if (!profileId) {
-      return res.status(400).json({ error: 'Missing profileId' });
-    }
-
-    const sock = activeSockets.get(profileId);
-    if (sock) {
-      sock.end();
-      activeSockets.delete(profileId);
-
-      const authFolder = `./auth_${profileId}`;
-      if (fs.existsSync(authFolder)) {
-        fs.rmSync(authFolder, { recursive: true, force: true });
-      }
-    }
-
-    res.json({ status: 'success' });
-  } catch (error) {
-    console.error('Disconnect error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/status/:profileId', (req, res) => {
-  const { profileId } = req.params;
-  const sock = activeSockets.get(profileId);
-
+// STATUS
+app.get("/status/:profileId", (req, res) => {
+  const client = clients.get(req.params.profileId);
   res.json({
-    connected: !!sock,
-    status: sock ? 'connected' : 'disconnected',
+    profileId: req.params.profileId,
+    active: !!client,
   });
 });
 
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'healthy',
-    activeConnections: activeSockets.size,
-  });
+// HEALTH
+app.get("/health", (req, res) => {
+  res.json({ status: "healthy", activeClients: clients.size });
 });
 
-app.listen(PORT, () => {
-  console.log(`WhatsApp Railway Service running on port ${PORT}`);
-});
+app.listen(3000, () => console.log("WhatsApp Railway Service running on port 3000"));
