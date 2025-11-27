@@ -14,7 +14,16 @@ app.use(express.json());
 const SESSIONS_DIR = "./sessions";
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR);
 
-// Create WA Client
+// ----------------------------
+// HEALTHCHECK ENDPOINT
+// ----------------------------
+app.get("/", (req, res) => {
+  res.status(200).send("OK");
+});
+
+// ----------------------------
+// CREATE CLIENT
+// ----------------------------
 async function createWhatsAppClient(profile, pairing = false) {
   const sessionPath = path.join(SESSIONS_DIR, profile);
   if (!fs.existsSync(sessionPath)) fs.mkdirSync(sessionPath);
@@ -26,7 +35,7 @@ async function createWhatsAppClient(profile, pairing = false) {
   const sock = makeWASocket({
     auth: state,
     printQRInTerminal: false,
-    browser: ["RAILWAY", "Chrome", "1.0"],
+    browser: ["Railway", "Chrome", "1.0"],
     syncFullHistory: false,
   });
 
@@ -49,36 +58,35 @@ async function createWhatsAppClient(profile, pairing = false) {
     }
 
     if (connection === "open") {
-      console.log("WA CONNECTED:", profile);
+      console.log("CONNECTED:", profile);
     }
   });
 
   return sock;
 }
 
-// API: INIT
+// ----------------------------
+// INIT ENDPOINT
+// ----------------------------
 app.post("/init", async (req, res) => {
   try {
-    const { profile, pairing } = req.body;
+    const { profile, pairing = false } = req.body;
 
-    if (!profile)
-      return res.status(400).json({ error: "profile is required" });
+    if (!profile) return res.status(400).json({ error: "profile is required" });
 
-    console.log("INIT REQUEST:", profile);
+    console.log("INIT:", profile);
 
     await createWhatsAppClient(profile, pairing);
 
     res.json({ success: true, profile });
   } catch (err) {
-    console.error("INIT ERROR", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get("/", (req, res) => {
-  res.send("WhatsApp Baileys Service Running");
-});
-
+// ----------------------------
+// START SERVER
+// ----------------------------
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log("WhatsApp Railway Service running on port", PORT);
