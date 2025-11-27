@@ -16,11 +16,7 @@ app.get("/health", (req, res) => {
 // INIT SESSION
 app.post("/init", async (req, res) => {
   try {
-    const { profile, pairing } = req.body;
-
-    if (!profile) {
-      return res.status(400).json({ success: false, error: "profile is required" });
-    }
+    const { profile } = req.body;
 
     const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${profile}`);
 
@@ -31,6 +27,12 @@ app.post("/init", async (req, res) => {
 
     sock.ev.on("creds.update", saveCreds);
 
+    sock.ev.on("connection.update", (update) => {
+      if (update.qr) {
+        sock.lastQR = update.qr;
+      }
+    });
+
     sessions[profile] = sock;
 
     return res.json({
@@ -39,32 +41,50 @@ app.post("/init", async (req, res) => {
       profile
     });
   } catch (e) {
-    console.error("INIT ERROR:", e);
     res.status(500).json({ error: e.message });
   }
 });
 
+
 // RETURN QR CODE
+// QR ENDPOINT (FULLY FIXED)
 app.get("/qr", async (req, res) => {
   try {
     const profile = req.query.profile;
 
     if (!profile) return res.status(400).send("profile is required");
-    if (!sessions[profile]) return res.status(404).send("session not found");
+    if (!sessions[profile]) return res.status(404).send("session not initialized");
 
-    let qrData;
-    sessions[profile].ev.on("connection.update", async (update) => {
+    const sock = sessions[profile];
+
+    // If QR already exists, send instantly
+    if (sock.lastQR) {
+      const svg = await QRCode.toString(sock.lastQR, { type: "svg" });
+      res.setHeader("Content-Type", "image/svg+xml");
+      return res.send(svg);
+    }
+
+    // Otherwise wait for new QR
+    sock.ev.on("connection.update", async (update) => {
       if (update.qr) {
-        qrData = update.qr;
-        const svg = await QRCode.toString(qrData, { type: "svg" });
+        sock.lastQR = update.qr; // store for next request
+        const svg = await QRCode.toString(update.qr, { type: "svg" });
         res.setHeader("Content-Type", "image/svg+xml");
         return res.send(svg);
       }
     });
+
+    // Timeout safeguard
+    setTimeout(() => {
+      if (!sock.lastQR) {
+        res.status(408).send("QR timeout");
+      }
+    }, 10000);
   } catch (e) {
     res.status(500).send(e.message);
   }
 });
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server running on port", PORT));
