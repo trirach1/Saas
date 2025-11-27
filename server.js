@@ -1,4 +1,3 @@
-
 // server.js
 import express from "express"
 import cors from "cors"
@@ -10,11 +9,15 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 
-const sessions = {}   // save open connections
+const sessions = {}
 
-// Create folder for session files
 const SESSIONS_FOLDER = "./sessions"
 if (!fs.existsSync(SESSIONS_FOLDER)) fs.mkdirSync(SESSIONS_FOLDER)
+
+/* ---------------- HEALTHCHECK (REQUIRED BY RAILWAY) ---------------- */
+app.get("/health", (req, res) => {
+    res.status(200).json({ status: "ok" })
+})
 
 async function createClient(profile) {
     const sessionPath = path.join(SESSIONS_FOLDER, profile)
@@ -38,9 +41,10 @@ async function createClient(profile) {
         }
 
         if (connection === "close") {
-            if (lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut) {
-                createClient(profile)
-            }
+            const shouldReconnect =
+                lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
+
+            if (shouldReconnect) createClient(profile)
         }
     })
 
@@ -49,17 +53,15 @@ async function createClient(profile) {
 
 /* ---------------- ROUTES ------------------- */
 
-// 1️⃣ INIT CONNECTION
+// INIT
 app.post("/init", async (req, res) => {
     const { profile } = req.body
 
-    if (!profile) {
+    if (!profile)
         return res.status(400).json({ error: "profile is required" })
-    }
 
-    if (sessions[profile]) {
+    if (sessions[profile])
         return res.json({ success: true, message: "Already initialized" })
-    }
 
     sessions[profile] = { qr: null }
 
@@ -72,38 +74,40 @@ app.post("/init", async (req, res) => {
     })
 })
 
-// 2️⃣ GET QR
-app.get("/qr", async (req, res) => {
+// QR
+app.get("/qr", (req, res) => {
     const profile = req.query.profile
 
-    if (!profile) return res.status(400).json({ error: "profile is required" })
-    if (!sessions[profile]) return res.status(404).json({ error: "not initialized" })
+    if (!profile)
+        return res.status(400).json({ error: "profile is required" })
 
-    if (!sessions[profile].qr) {
+    if (!sessions[profile])
+        return res.status(404).json({ error: "not initialized" })
+
+    const qr = sessions[profile].qr
+    if (!qr)
         return res.json({ success: false, message: "QR not ready" })
-    }
 
-    return res.json({
-        success: true,
-        qr: sessions[profile].qr
-    })
+    res.json({ success: true, qr })
 })
 
-// 3️⃣ CHECK STATUS
-app.get("/status", async (req, res) => {
+// STATUS
+app.get("/status", (req, res) => {
     const profile = req.query.profile
 
-    if (!profile) return res.status(400).json({ error: "profile is required" })
-    if (!sessions[profile]) return res.status(404).json({ error: "not initialized" })
+    if (!profile)
+        return res.status(400).json({ error: "profile is required" })
 
-    return res.json({
+    if (!sessions[profile])
+        return res.status(404).json({ error: "not initialized" })
+
+    res.json({
         success: true,
         qr_ready: !!sessions[profile].qr
     })
 })
 
-/* ---------------- START SERVER ------------------- */
+// START SERVER
 app.listen(8080, () => {
     console.log("WhatsApp Railway Service running on port 8080")
 })
-
