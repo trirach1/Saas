@@ -63,33 +63,24 @@ async function startSession(profileId, userId) {
 }
 
 // Initialize connection
-app.post('/api/init', async (req, res) => {
+app.post("/init", async (req, res) => {
   try {
-    const { profileId, userId, usePairing } = req.body;
+    const { profile_id } = req.body;
 
-    if (!profileId || !userId) {
-      return res.status(400).json({ error: 'profileId and userId required' });
+    if (!profile_id) {
+      return res.status(400).json({ success: false, error: "Missing profile_id" });
     }
 
-    logger.info({ profileId, usePairing }, 'Initializing session');
+    console.log("Initialize WhatsApp session for:", profile_id);
 
-    const session = await startSession(profileId, userId);
-
-    // Wait briefly for QR code generation
-    await new Promise(resolve => setTimeout(resolve, 2000));
-
-    const currentSession = sessions.get(profileId);
-    
-    res.json({
-      success: true,
-      qrCode: currentSession?.qrCode,
-      pairingCode: currentSession?.pairingCode
-    });
-  } catch (error) {
-    logger.error({ error: error.message }, 'Init failed');
-    res.status(500).json({ error: error.message });
+    const result = await createWhatsAppClient(profile_id);
+    res.json({ success: true, message: "Session initialized", result });
+  } catch (err) {
+    console.error("Init error:", err);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
+
 
 // Get connection status
 app.get('/api/status/:profileId', (req, res) => {
