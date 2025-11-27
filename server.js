@@ -87,5 +87,11 @@ app.post("/send", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+app.get("/", (req, res) => {
+  res.status(200).send("OK");
+});
 
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "healthy" });
+});
 app.listen(8080, () => console.log("WhatsApp Railway Service running on port 8080"));
