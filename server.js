@@ -1,84 +1,109 @@
-import express from "express";
-import makeWASocket, {
-  useMultiFileAuthState,
-  DisconnectReason
-} from "@whiskeysockets/baileys";
-import fs from "fs-extra";
-import pino from "pino";
 
-const app = express();
-app.use(express.json());
+// server.js
+import express from "express"
+import cors from "cors"
+import makeWASocket, { useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason } from "@whiskeysockets/baileys"
+import fs from "fs"
+import path from "path"
 
-const clients = {};
+const app = express()
+app.use(cors())
+app.use(express.json())
 
-async function createWhatsAppClient(profile) {
-  console.log("Starting connection for profile:", profile);
+const sessions = {}   // save open connections
 
-  const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${profile}`);
+// Create folder for session files
+const SESSIONS_FOLDER = "./sessions"
+if (!fs.existsSync(SESSIONS_FOLDER)) fs.mkdirSync(SESSIONS_FOLDER)
 
-  const sock = makeWASocket({
-    logger: pino({ level: "silent" }),
-    printQRInTerminal: false,
-    auth: state,
-    syncFullHistory: false
-  });
+async function createClient(profile) {
+    const sessionPath = path.join(SESSIONS_FOLDER, profile)
 
-  sock.ev.on("creds.update", saveCreds);
+    const { state, saveCreds } = await useMultiFileAuthState(sessionPath)
+    const { version } = await fetchLatestBaileysVersion()
 
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update;
+    const sock = makeWASocket({
+        version,
+        auth: state,
+        printQRInTerminal: false
+    })
 
-    if (qr) {
-      console.log("QR GENERATED FOR", profile);
-      clients[profile].qr = qr;
-    }
+    sock.ev.on("creds.update", saveCreds)
 
-    if (connection === "close") {
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+    sock.ev.on("connection.update", (update) => {
+        const { connection, qr, lastDisconnect } = update
 
-      if (shouldReconnect) {
-        console.log("Reconnecting for profile:", profile);
-        createWhatsAppClient(profile);
-      }
-    }
+        if (qr) {
+            sessions[profile].qr = qr
+        }
 
-    if (connection === "open") {
-      console.log("WA CONNECTED:", profile);
-      clients[profile].connected = true;
-    }
-  });
+        if (connection === "close") {
+            if (lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut) {
+                createClient(profile)
+            }
+        }
+    })
 
-  return sock;
+    return sock
 }
 
+/* ---------------- ROUTES ------------------- */
+
+// 1️⃣ INIT CONNECTION
 app.post("/init", async (req, res) => {
-  const profile = req.body.profile;
+    const { profile } = req.body
 
-  if (!profile) {
-    return res.status(400).json({ error: "profile is required" });
-  }
+    if (!profile) {
+        return res.status(400).json({ error: "profile is required" })
+    }
 
-  if (!clients[profile]) {
-    clients[profile] = { qr: null, connected: false };
-    createWhatsAppClient(profile);
-  }
+    if (sessions[profile]) {
+        return res.json({ success: true, message: "Already initialized" })
+    }
 
-  res.json({ success: true, message: "Client initializing", profile });
-});
+    sessions[profile] = { qr: null }
 
-app.get("/qr/:profile", (req, res) => {
-  const profile = req.params.profile;
+    createClient(profile)
 
-  if (!clients[profile] || !clients[profile].qr) {
-    return res.json({ qr: null });
-  }
+    return res.json({
+        success: true,
+        message: "Client initializing",
+        profile
+    })
+})
 
-  res.json({ qr: clients[profile].qr });
-});
+// 2️⃣ GET QR
+app.get("/qr", async (req, res) => {
+    const profile = req.query.profile
 
-app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
-});
+    if (!profile) return res.status(400).json({ error: "profile is required" })
+    if (!sessions[profile]) return res.status(404).json({ error: "not initialized" })
 
-app.listen(8080, () => console.log("WhatsApp Railway Service running on port 8080"));
+    if (!sessions[profile].qr) {
+        return res.json({ success: false, message: "QR not ready" })
+    }
+
+    return res.json({
+        success: true,
+        qr: sessions[profile].qr
+    })
+})
+
+// 3️⃣ CHECK STATUS
+app.get("/status", async (req, res) => {
+    const profile = req.query.profile
+
+    if (!profile) return res.status(400).json({ error: "profile is required" })
+    if (!sessions[profile]) return res.status(404).json({ error: "not initialized" })
+
+    return res.json({
+        success: true,
+        qr_ready: !!sessions[profile].qr
+    })
+})
+
+/* ---------------- START SERVER ------------------- */
+app.listen(8080, () => {
+    console.log("WhatsApp Railway Service running on port 8080")
+})
+
