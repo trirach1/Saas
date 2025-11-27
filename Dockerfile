@@ -1,5 +1,8 @@
 FROM node:20-alpine
 
+# Install git (required by npm when dependencies use git repos)
+RUN apk add --no-cache git
+
 WORKDIR /app
 
 COPY package*.json ./
