@@ -1,14 +1,11 @@
-FROM node:18-alpine
+FROM node:18
 
 WORKDIR /app
-
 COPY package*.json ./
-RUN npm install --production
+
+RUN npm install --omit=dev
 
 COPY . .
 
-RUN mkdir -p sessions
-
-EXPOSE 3000
-
-CMD ["node", "server.js"]
+EXPOSE 8080
+CMD ["npm", "start"]
