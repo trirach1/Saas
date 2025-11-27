@@ -1,85 +1,136 @@
-import makeWASocket, {
-  DisconnectReason,
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion
-} from "@whiskeysockets/baileys"
+const express = require('express');
+const makeWASocket = require('@whiskeysockets/baileys').default;
+const { useMultiFileAuthState, DisconnectReason, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const QRCode = require('qrcode');
+const P = require('pino');
 
-import express from "express"
-import cors from "cors"
-import fs from "fs"
+const app = express();
+app.use(express.json());
 
-const app = express()
-app.use(express.json())
-app.use(cors())
+const logger = P({ level: 'info' });
+const sessions = new Map();
 
-let globalSock = null
+async function startSession(profileId, userId) {
+  try {
+    const sessionPath = `./sessions/${profileId}`;
+    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
 
-async function createWhatsAppClient() {
-  const authFolder = "./sessions"
-  if (!fs.existsSync(authFolder)) fs.mkdirSync(authFolder)
+    const sock = makeWASocket({
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger)
+      },
+      logger,
+      printQRInTerminal: false
+    });
 
-  const { state, saveCreds } = await useMultiFileAuthState(authFolder)
-  const { version } = await fetchLatestBaileysVersion()
+    let qrCode = null;
+    let pairingCode = null;
 
-  console.log("Starting Baileys client...")
+    sock.ev.on('creds.update', saveCreds);
 
-  const sock = makeWASocket({
-    version,
-    printQRInTerminal: true,
-    auth: state
-  })
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
 
-  sock.ev.on("creds.update", saveCreds)
+      if (qr) {
+        qrCode = await QRCode.toDataURL(qr);
+        logger.info({ profileId }, 'QR Code generated');
+      }
 
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update
+      if (connection === 'close') {
+        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+        logger.info({ profileId, shouldReconnect }, 'Connection closed');
+        
+        if (shouldReconnect) {
+          setTimeout(() => startSession(profileId, userId), 3000);
+        } else {
+          sessions.delete(profileId);
+        }
+      }
 
-    if (qr) {
-      console.log("QR RECEIVED")
-    }
+      if (connection === 'open') {
+        logger.info({ profileId }, 'Connection opened');
+        // TODO: Notify Supabase that connection is established
+      }
+    });
 
-    if (connection === "close") {
-      const shouldReconnect =
-        lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut
-
-      console.log("Connection closed. Reconnect:", shouldReconnect)
-
-      if (shouldReconnect) createWhatsAppClient()
-      else console.log("Logged out. Delete /sessions folder to reset.")
-    }
-
-    if (connection === "open") {
-      console.log("WhatsApp Connected Successfully!")
-    }
-  })
-
-  return sock
+    sessions.set(profileId, { sock, qrCode, pairingCode });
+    return { sock, qrCode, pairingCode };
+  } catch (error) {
+    logger.error({ profileId, error: error.message }, 'Failed to start session');
+    throw error;
+  }
 }
 
-// Start client
-globalSock = await createWhatsAppClient()
-
-// API — health check
-app.get("/", (req, res) => {
-  res.send({ status: "ok", message: "WhatsApp Railway Service Running" })
-})
-
-// API — send message
-app.post("/send", async (req, res) => {
+// Initialize connection
+app.post('/api/init', async (req, res) => {
   try {
-    const { number, message } = req.body
+    const { profileId, userId, usePairing } = req.body;
 
-    if (!number || !message)
-      return res.status(400).json({ error: "number & message required" })
+    if (!profileId || !userId) {
+      return res.status(400).json({ error: 'profileId and userId required' });
+    }
 
-    await globalSock.sendMessage(number + "@s.whatsapp.net", { text: message })
-    res.json({ success: true })
-  } catch (err) {
-    console.log("Send error:", err)
-    res.status(500).json({ success: false, error: err + "" })
+    logger.info({ profileId, usePairing }, 'Initializing session');
+
+    const session = await startSession(profileId, userId);
+
+    // Wait briefly for QR code generation
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    const currentSession = sessions.get(profileId);
+    
+    res.json({
+      success: true,
+      qrCode: currentSession?.qrCode,
+      pairingCode: currentSession?.pairingCode
+    });
+  } catch (error) {
+    logger.error({ error: error.message }, 'Init failed');
+    res.status(500).json({ error: error.message });
   }
-})
+});
 
-app.listen(3000, () =>
-  console.log("WhatsApp Railway Service running on port 3000")
-)
+// Get connection status
+app.get('/api/status/:profileId', (req, res) => {
+  const { profileId } = req.params;
+  const session = sessions.get(profileId);
+
+  if (!session) {
+    return res.json({ connected: false });
+  }
+
+  const connected = session.sock?.user !== undefined;
+  res.json({
+    connected,
+    phone: session.sock?.user?.id || null
+  });
+});
+
+// Disconnect session
+app.post('/api/disconnect', async (req, res) => {
+  try {
+    const { profileId } = req.body;
+    const session = sessions.get(profileId);
+
+    if (session?.sock) {
+      await session.sock.logout();
+      sessions.delete(profileId);
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    logger.error({ error: error.message }, 'Disconnect failed');
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', sessions: sessions.size });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  logger.info({ port: PORT }, 'WhatsApp Baileys service started');
+});
