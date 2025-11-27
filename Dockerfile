@@ -1,20 +1,12 @@
-FROM node:18-slim
-
-RUN apt-get update && apt-get install -y git wget && apt-get clean
+FROM node:18
 
 WORKDIR /app
+COPY package*.json ./
 
-COPY package.json ./
-
-RUN npm install
+RUN npm install --omit=dev
 
 COPY . .
 
-EXPOSE 3000
-
-HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-  CMD wget -qO- http://localhost:8080/health || exit 1
-
 EXPOSE 8080
+CMD ["npm", "start"]
 
-CMD ["node", "server.js"]
