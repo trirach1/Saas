@@ -2,12 +2,15 @@ import express from "express";
 import cors from "cors";
 import fs from "fs";
 
-import {
-  default as makeWASocket,
+// Import Baileys in a SAFE WAY for all versions
+import * as baileys from "@whiskeysockets/baileys";
+
+const {
+  default: makeWASocket,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason
-} from "@whiskeysockets/baileys";
+} = baileys;
 
 const app = express();
 app.use(cors());
@@ -15,7 +18,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
 
-// Ensure sessions/ directory exists
+// Ensure sessions folder
 if (!fs.existsSync("./sessions")) {
   fs.mkdirSync("./sessions");
 }
@@ -37,17 +40,24 @@ async function createWhatsAppClient(profileId) {
     printQRInTerminal: true
   });
 
-  // MUST HAVE THIS OR DISCONNECTS
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    if (qr) console.log("QR:", qr);
+    if (qr) {
+      console.log("QR CODE READY");
+      console.log(qr);
+    }
+
+    if (connection === "open") {
+      console.log("Connected:", profileId);
+    }
 
     if (connection === "close") {
       const reason =
-        lastDisconnect?.error?.output?.statusCode || DisconnectReason.connectionClosed;
+        lastDisconnect?.error?.output?.statusCode ||
+        DisconnectReason.connectionClosed;
 
       console.log("Connection closed:", reason);
 
@@ -56,35 +66,24 @@ async function createWhatsAppClient(profileId) {
         createWhatsAppClient(profileId);
       }
     }
-
-    if (connection === "open") {
-      console.log("Connected:", profileId);
-    }
   });
 
   clients[profileId] = sock;
   return sock;
 }
 
-// -------- API ENDPOINTS ---------- //
-
+// API
 app.post("/init", async (req, res) => {
   const { profileId } = req.body;
 
   if (!profileId)
-    return res.status(400).json({ success: false, message: "profileId missing" });
+    return res.status(400).json({ success: false, error: "profileId missing" });
 
   if (!clients[profileId]) await createWhatsAppClient(profileId);
 
-  res.json({ success: true, message: "Client started" });
-});
-
-app.get("/status/:profileId", (req, res) => {
-  res.json({ connected: !!clients[req.params.profileId] });
+  res.json({ success: true });
 });
 
 app.get("/health", (req, res) => res.send("OK"));
 
-app.listen(PORT, () => {
-  console.log("WhatsApp Railway Service running on port " + PORT);
-});
+app.listen(PORT, () => console.log("WhatsApp Railway Service running on port " + PORT));
