@@ -1,21 +1,23 @@
 import express from "express";
 import QRCode from "qrcode";
 import { Boom } from "@hapi/boom";
+import fs from "fs";
 import {
   makeWASocket,
   fetchLatestBaileysVersion,
   useMultiFileAuthState,
   DisconnectReason
 } from "@whiskeysockets/baileys";
-import fs from "fs";
 
 const app = express();
 app.use(express.json());
 
 const sessions = {};
-const reconnectAttempts = {}; // Track reconnection attempts
+const reconnectAttempts = {};
+const connectedPhones = {}; // Store connected phone numbers
+const connectionStatus = {}; // Track actual connection status
 const MAX_RECONNECT_ATTEMPTS = 3;
-const RECONNECT_DELAY = 5000; // 5 seconds
+const RECONNECT_DELAY = 5000;
 
 // -------------------------------------------
 // CREATE CLIENT (QR + PAIRING)
@@ -31,8 +33,8 @@ async function createClient(profile, pairing = false) {
     auth: state,
     printQRInTerminal: false,
     syncFullHistory: false,
-    browser: ["AutomateAI", "Chrome", "1.0"],
-    mobile: false, // Must be disabled
+    browser: ["Web", "Chrome", "1.0"],
+    mobile: false,
   });
 
   sock.lastQR = null;
@@ -46,65 +48,80 @@ async function createClient(profile, pairing = false) {
     if (qr) {
       console.log("QR received:", profile);
       sock.lastQR = qr;
-      reconnectAttempts[profile] = 0; // Reset attempts on new QR
+      reconnectAttempts[profile] = 0;
     }
 
     if (pairingCode) {
       console.log("PAIRING CODE:", pairingCode);
       sock.lastPairingCode = pairingCode;
-      reconnectAttempts[profile] = 0; // Reset attempts on pairing
+      reconnectAttempts[profile] = 0;
     }
 
     if (connection === "open") {
-      console.log("✅ CONNECTED:", profile);
-      reconnectAttempts[profile] = 0; // Reset on successful connection
+      console.log("CONNECTED:", profile);
+      reconnectAttempts[profile] = 0;
+      connectionStatus[profile] = "open";
+      
+      // Store the connected phone number
+      try {
+        const phoneNumber = sock.user?.id?.split(':')[0] || sock.user?.id;
+        if (phoneNumber) {
+          connectedPhones[profile] = phoneNumber;
+          console.log("Connected phone:", phoneNumber);
+        }
+      } catch (error) {
+        console.error("Error getting phone number:", error);
+      }
     }
 
     if (connection === "close") {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      console.log("❌ Disconnected:", reason, "Profile:", profile);
+      console.log("Disconnected:", reason);
 
-      // Don't reconnect if logged out or too many attempts
       if (reason === DisconnectReason.loggedOut) {
-        console.log("Logged out - cleaning up session:", profile);
-        delete sessions[profile];
-        delete reconnectAttempts[profile];
-        return;
-      }
-
-      // Check reconnection attempts
-      if (!reconnectAttempts[profile]) reconnectAttempts[profile] = 0;
-      reconnectAttempts[profile]++;
-
-      if (reconnectAttempts[profile] > MAX_RECONNECT_ATTEMPTS) {
-        console.error(`❌ Max reconnect attempts reached for ${profile}. Stopping.`);
-        delete sessions[profile];
-        delete reconnectAttempts[profile];
-        return;
-      }
-
-      // Handle 428 (Precondition Required) - usually rate limiting
-      if (reason === 428) {
-        console.log(`⚠️  Rate limited (428). Waiting longer before retry ${reconnectAttempts[profile]}/${MAX_RECONNECT_ATTEMPTS}`);
-        
-        // Clean session data and wait longer
+        console.log("Logged out, cleaning session:", profile);
         const sessionPath = `./sessions/${profile}`;
         if (fs.existsSync(sessionPath)) {
           fs.rmSync(sessionPath, { recursive: true, force: true });
         }
-        
-        setTimeout(async () => {
-          console.log("Retrying after 428...", profile);
-          await createClient(profile, pairing);
-        }, RECONNECT_DELAY * reconnectAttempts[profile]); // Exponential backoff
+        delete sessions[profile];
+        delete reconnectAttempts[profile];
+        delete connectedPhones[profile];
+        delete connectionStatus[profile];
         return;
       }
 
-      // For other disconnect reasons, wait before reconnecting
-      console.log(`Reconnecting in ${RECONNECT_DELAY}ms (attempt ${reconnectAttempts[profile]}/${MAX_RECONNECT_ATTEMPTS})...`);
-      setTimeout(async () => {
-        await createClient(profile, pairing);
-      }, RECONNECT_DELAY);
+      if (!reconnectAttempts[profile]) {
+        reconnectAttempts[profile] = 0;
+      }
+
+      if (reconnectAttempts[profile] >= MAX_RECONNECT_ATTEMPTS) {
+        console.log("Max reconnect attempts reached for:", profile);
+        delete connectedPhones[profile];
+        delete connectionStatus[profile];
+        return;
+      }
+
+      reconnectAttempts[profile]++;
+      console.log(`Reconnecting... (${reconnectAttempts[profile]}/${MAX_RECONNECT_ATTEMPTS})`, profile);
+
+      if (reason === 428) {
+        console.log("Rate limited (428), cleaning session and waiting longer");
+        const sessionPath = `./sessions/${profile}`;
+        if (fs.existsSync(sessionPath)) {
+          fs.rmSync(sessionPath, { recursive: true, force: true });
+        }
+        delete connectedPhones[profile];
+        delete connectionStatus[profile];
+        
+        setTimeout(() => {
+          createClient(profile, pairing);
+        }, RECONNECT_DELAY * 3);
+      } else {
+        setTimeout(() => {
+          createClient(profile, pairing);
+        }, RECONNECT_DELAY * reconnectAttempts[profile]);
+      }
     }
   });
 
@@ -120,14 +137,11 @@ app.post("/init", async (req, res) => {
     const { profile, pairing } = req.body;
     if (!profile) return res.status(400).json({ error: "profile required" });
 
-    // Clean up existing session if any
+    // Clean up existing session
     if (sessions[profile]) {
-      console.log("Cleaning up existing session:", profile);
       sessions[profile].end();
       delete sessions[profile];
     }
-
-    // Reset reconnect attempts
     reconnectAttempts[profile] = 0;
 
     await createClient(profile, pairing === true);
@@ -173,7 +187,7 @@ app.post("/pairing", async (req, res) => {
 app.get("/qr", async (req, res) => {
   const profile = req.query.profile;
 
-  if (!profile) return res.status(400).send("profile required");
+  if (!profile) return res.status(400).json({ error: "profile required" });
 
   const sock = sessions[profile];
 
@@ -189,57 +203,75 @@ app.get("/qr", async (req, res) => {
 });
 
 // -------------------------------------------
-// DISCONNECT
-// -------------------------------------------
-app.post("/disconnect", (req, res) => {
-  const { profile } = req.body;
-  if (!profile) return res.status(400).json({ error: "profile required" });
-
-  const sock = sessions[profile];
-  if (sock) {
-    sock.end();
-    delete sessions[profile];
-    delete reconnectAttempts[profile];
-    
-    // Clean session data
-    const sessionPath = `./sessions/${profile}`;
-    if (fs.existsSync(sessionPath)) {
-      fs.rmSync(sessionPath, { recursive: true, force: true });
-    }
-  }
-
-  return res.json({ success: true });
-});
-
-// -------------------------------------------
-// STATUS
+// STATUS ENDPOINT
 // -------------------------------------------
 app.get("/status", (req, res) => {
   const profile = req.query.profile;
   if (!profile) return res.status(400).json({ error: "profile required" });
 
   const sock = sessions[profile];
+  if (!sock) {
+    return res.status(404).json({ 
+      error: "session not found",
+      connected: false,
+      exists: false
+    });
+  }
+
+  // Use the tracked connection status instead of WebSocket state
+  const isConnected = connectionStatus[profile] === "open";
+
   return res.json({
-    exists: !!sock,
-    connected: sock?.ws?.readyState === 1,
-    hasQR: !!sock?.lastQR,
-    hasPairing: !!sock?.lastPairingCode,
-    attempts: reconnectAttempts[profile] || 0
+    success: true,
+    connected: isConnected,
+    exists: true,
+    connection: isConnected ? "open" : "closed",
+    phone: connectedPhones[profile] || null,
+    hasQR: !!sock.lastQR,
+    hasPairing: !!sock.lastPairingCode,
+    qr: sock.lastQR ? true : false,
+    pairing: sock.lastPairingCode || null,
+    reconnectAttempts: reconnectAttempts[profile] || 0
   });
+});
+
+// -------------------------------------------
+// DISCONNECT ENDPOINT
+// -------------------------------------------
+app.post("/disconnect", (req, res) => {
+  const { profile } = req.body;
+  if (!profile) return res.status(400).json({ error: "profile required" });
+
+  const sock = sessions[profile];
+  if (!sock) {
+    return res.status(404).json({ error: "session not found" });
+  }
+
+  sock.end();
+  delete sessions[profile];
+  delete reconnectAttempts[profile];
+  delete connectedPhones[profile];
+  delete connectionStatus[profile];
+
+  const sessionPath = `./sessions/${profile}`;
+  if (fs.existsSync(sessionPath)) {
+    fs.rmSync(sessionPath, { recursive: true, force: true });
+  }
+
+  return res.json({ success: true, message: "session disconnected" });
 });
 
 // DEBUG
 app.get("/debug", (req, res) => {
   res.json({
     sessions: Object.keys(sessions),
-    reconnectAttempts,
-    qr: sessions["test-profile"]?.lastQR ? true : false,
-    pairing: sessions["test-profile"]?.lastPairingCode || null,
-    ws: sessions["test-profile"]?.ws?.readyState || "no ws"
+    phones: connectedPhones,
+    connectionStatus: connectionStatus,
+    reconnectAttempts: reconnectAttempts
   });
 });
 
 // HEALTH
-app.get("/health", (req, res) => res.json({ status: "healthy", sessions: Object.keys(sessions).length }));
+app.get("/health", (req, res) => res.send("OK"));
 
-app.listen(8080, "0.0.0.0", () => console.log("✅ WhatsApp Service running on port 8080"));
+app.listen(8080, "0.0.0.0", () => console.log("WhatsApp Service running on port 8080"));
