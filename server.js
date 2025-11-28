@@ -42,6 +42,56 @@ async function createClient(profile, pairing = false) {
 
   sock.ev.on("creds.update", saveCreds);
 
+  // Handle incoming messages
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    console.log("Messages received:", type);
+    
+    for (const msg of messages) {
+      // Skip if message is from us or has no text
+      if (msg.key.fromMe || !msg.message?.conversation) {
+        continue;
+      }
+
+      const from = msg.key.remoteJid; // sender's number
+      const messageText = msg.message.conversation;
+      
+      console.log(`New message from ${from}: ${messageText}`);
+
+      try {
+        // Forward to Supabase edge function for AI processing
+        const supabaseUrl = process.env.SUPABASE_URL || 'https://hrshudfqrjyrgppkiaas.supabase.co';
+        const webhookUrl = `${supabaseUrl}/functions/v1/whatsapp-web-message`;
+        
+        const response = await fetch(webhookUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            profile,
+            from,
+            message: messageText,
+            messageId: msg.key.id
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          
+          // Send AI response back via WhatsApp
+          if (data.reply) {
+            await sock.sendMessage(from, { text: data.reply });
+            console.log(`Sent reply to ${from}`);
+          }
+        } else {
+          console.error('Webhook error:', response.status, await response.text());
+        }
+      } catch (error) {
+        console.error('Error processing message:', error);
+      }
+    }
+  });
+
   sock.ev.on("connection.update", async (update) => {
     const { qr, connection, lastDisconnect, pairingCode } = update;
 
