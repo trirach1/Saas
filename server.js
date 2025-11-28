@@ -16,7 +16,7 @@ const sessions = {};
 // -------------------------------------------
 // CREATE CLIENT (QR + PAIRING)
 // -------------------------------------------
-async function createClient(profile, pairing = false, phone = null) {
+async function createClient(profile, pairing = false) {
   console.log("Starting client:", profile, "pairing:", pairing);
 
   const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${profile}`);
@@ -27,8 +27,10 @@ async function createClient(profile, pairing = false, phone = null) {
     auth: state,
     printQRInTerminal: false,
     syncFullHistory: false,
-    browser: ["Railway", "Chrome", "1.0"],
-    mobile: pairing ? true : false, // required for pairing
+    browser: ["Web", "Chrome", "1.0"],
+
+    // ❗ VERY IMPORTANT — MUST BE DISABLED
+    mobile: false, 
   });
 
   sock.lastQR = null;
@@ -37,18 +39,15 @@ async function createClient(profile, pairing = false, phone = null) {
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async (update) => {
-
     const { qr, connection, lastDisconnect, pairingCode } = update;
 
-    // QR LOGIN
     if (qr) {
-      console.log("QR received for:", profile);
+      console.log("QR received:", profile);
       sock.lastQR = qr;
     }
 
-    // PAIRING CODE LOGIN
     if (pairingCode) {
-      console.log("Pairing code:", pairingCode);
+      console.log("PAIRING CODE:", pairingCode);
       sock.lastPairingCode = pairingCode;
     }
 
@@ -62,7 +61,7 @@ async function createClient(profile, pairing = false, phone = null) {
 
       if (reason !== DisconnectReason.loggedOut) {
         console.log("Reconnecting...", profile);
-        await createClient(profile, pairing, phone);
+        await createClient(profile, pairing);
       }
     }
   });
@@ -72,7 +71,7 @@ async function createClient(profile, pairing = false, phone = null) {
 }
 
 // -------------------------------------------
-// INIT
+// INIT CLIENT
 // -------------------------------------------
 app.post("/init", async (req, res) => {
   try {
@@ -90,14 +89,14 @@ app.post("/init", async (req, res) => {
 });
 
 // -------------------------------------------
-// PAIRING CODE (PHONE REQUIRED)
+// PAIRING CODE REQUEST
 // -------------------------------------------
 app.post("/pairing", async (req, res) => {
   try {
     const { profile, phone } = req.body;
 
     if (!profile) return res.status(400).json({ error: "profile required" });
-    if (!phone) return res.status(400).json({ error: "phone required. format: 212612345678" });
+    if (!phone) return res.status(400).json({ error: "phone required, ex: 212612345678" });
 
     const sock = sessions[profile];
     if (!sock) return res.status(404).json({ error: "session not initialized" });
@@ -106,18 +105,18 @@ app.post("/pairing", async (req, res) => {
 
     const code = await sock.requestPairingCode(phone);
 
-    if (!code) return res.status(500).json({ error: "pairing failed" });
+    if (!code) return res.status(500).json({ error: "failed to generate pairing code" });
 
     return res.json({ success: true, pairing_code: code });
 
   } catch (e) {
     console.log("PAIRING ERROR:", e);
-    return res.status(500).json({ error: "Connection Closed" });
+    return res.status(500).json({ error: e.message });
   }
 });
 
 // -------------------------------------------
-// QR
+// QR ENDPOINT
 // -------------------------------------------
 app.get("/qr", async (req, res) => {
   const profile = req.query.profile;
@@ -127,6 +126,7 @@ app.get("/qr", async (req, res) => {
   const sock = sessions[profile];
 
   if (!sock) return res.status(404).send("session not initialized");
+
   if (sock.lastQR) {
     const svg = await QRCode.toString(sock.lastQR, { type: "svg" });
     res.setHeader("Content-Type", "image/svg+xml");
@@ -140,8 +140,8 @@ app.get("/qr", async (req, res) => {
 app.get("/debug", (req, res) => {
   res.json({
     sessions: Object.keys(sessions),
-    lastQR: sessions["test-profile"]?.lastQR ? true : false,
-    lastPairingCode: sessions["test-profile"]?.lastPairingCode || null,
+    qr: sessions["test-profile"]?.lastQR ? true : false,
+    pairing: sessions["test-profile"]?.lastPairingCode || null,
     ws: sessions["test-profile"]?.ws?.readyState || "no ws"
   });
 });
