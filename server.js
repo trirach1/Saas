@@ -33,8 +33,9 @@ async function createClient(profile, pairing = false) {
     auth: state,
     printQRInTerminal: false,
     syncFullHistory: false,
-    browser: ["Web", "Chrome", "1.0"],
-    mobile: false,
+    // Use WhatsApp mobile-style session when using pairing codes
+    browser: pairing ? ["Android", "Chrome", "2.0"] : ["Web", "Chrome", "1.0"],
+    mobile: pairing,
   });
 
   sock.lastQR = null;
@@ -217,9 +218,11 @@ app.post("/pairing", async (req, res) => {
     const sock = sessions[profile];
     if (!sock) return res.status(404).json({ error: "session not initialized" });
 
-    console.log("Requesting pairing code for:", phone);
+    // Clean and log phone number in international format (digits only)
+    const cleanPhone = String(phone).replace(/\D/g, '');
+    console.log("Requesting pairing code for:", cleanPhone);
 
-    const code = await sock.requestPairingCode(phone);
+    const code = await sock.requestPairingCode(cleanPhone);
 
     if (!code) return res.status(500).json({ error: "failed to generate pairing code" });
 
