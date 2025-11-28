@@ -11,35 +11,36 @@ import {
 const app = express();
 app.use(express.json());
 
-// IMPORTANT: SESSION STORE
-const sessions = {}; // <-- THIS WAS MISSING !!!
+// Store active WhatsApp sessions
+const sessions = {};
 
-// ---------------- INIT ------------------
+// ---------------- INIT SESSION ------------------
 
 app.post("/init", async (req, res) => {
   try {
-    const { profile, pairing } = req.body;
+    const { profile } = req.body;
 
     if (!profile) return res.status(400).json({ error: "profile required" });
 
     console.log("Initializing WhatsApp for:", profile);
 
     const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${profile}`);
-
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
       version,
       auth: state,
       printQRInTerminal: false,
-      syncFullHistory: false,
       browser: ["Railway", "Chrome", "1.0"],
+      syncFullHistory: false,
     });
 
-    sock.lastQR = null;
+    sock.lastQR = null;       // for QR
+    sock.pairCode = null;     // for pairing code
 
     sock.ev.on("creds.update", saveCreds);
 
+    // Listen for connection updates
     sock.ev.on("connection.update", (update) => {
       const { qr, connection, lastDisconnect } = update;
 
@@ -48,18 +49,17 @@ app.post("/init", async (req, res) => {
         sock.lastQR = qr;
       }
 
-      if (connection === "close") {
-        const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
-
-        console.log("Disconnected:", reason);
-
-        if (reason !== DisconnectReason.loggedOut) {
-          createWhatsAppClient(profile);
-        }
-      }
-
       if (connection === "open") {
         console.log("CONNECTED:", profile);
+      }
+
+      if (connection === "close") {
+        const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
+        console.log("DISCONNECTED:", reason);
+
+        if (reason !== DisconnectReason.loggedOut) {
+          console.log("Reconnecting...");
+        }
       }
     });
 
@@ -77,15 +77,13 @@ app.post("/init", async (req, res) => {
   }
 });
 
-// ---------------- QR endpoint ------------------
+// ---------------- GET QR CODE ------------------
 
 app.get("/qr", async (req, res) => {
   const profile = req.query.profile;
-
   if (!profile) return res.status(400).send("profile required");
 
   const sock = sessions[profile];
-
   if (!sock) return res.status(404).send("session not initialized");
 
   if (sock.lastQR) {
@@ -94,26 +92,50 @@ app.get("/qr", async (req, res) => {
     return res.send(svg);
   }
 
-  // WAIT FOR QR
-  let sent = false;
-  const listener = async (update) => {
-    if (update.qr && !sent) {
-      sent = true;
-      sock.ev.off("connection.update", listener);
-      const svg = await QRCode.toString(update.qr, { type: "svg" });
-      res.setHeader("Content-Type", "image/svg+xml");
-      res.send(svg);
-    }
-  };
+  res.status(408).send("QR timeout");
+});
 
-  sock.ev.on("connection.update", listener);
+// ---------------- PAIRING CODE ENDPOINT ------------------
 
-  setTimeout(() => {
-    if (!sent) {
-      sock.ev.off("connection.update", listener);
-      res.status(408).send("QR timeout");
-    }
-  }, 10000);
+app.post("/pairing", async (req, res) => {
+  try {
+    const { profile, phone } = req.body;
+
+    if (!profile) return res.status(400).json({ error: "profile required" });
+    if (!phone) return res.status(400).json({ error: "phone required. format: 212612345678" });
+
+    const sock = sessions[profile];
+    if (!sock) return res.status(404).send("session not initialized");
+
+    console.log("Requesting pairing code for:", phone);
+
+    const pairingCode = await sock.requestPairingCode(phone);
+
+    // Store it so frontend can fetch it
+    sock.pairCode = pairingCode;
+
+    return res.json({
+      success: true,
+      pairingCode,
+    });
+
+  } catch (e) {
+    console.error("PAIRING ERROR:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------- GET PAIRING CODE ------------------
+
+app.get("/pairing", (req, res) => {
+  const profile = req.query.profile;
+
+  const sock = sessions[profile];
+  if (!sock) return res.status(404).send("session not initialized");
+
+  if (!sock.pairCode) return res.status(404).send("pairing code not set yet");
+
+  res.json({ pairingCode: sock.pairCode });
 });
 
 // ---------------- DEBUG ------------------
@@ -121,8 +143,8 @@ app.get("/qr", async (req, res) => {
 app.get("/debug", (req, res) => {
   res.json({
     sessions: Object.keys(sessions),
-    hasQR: sessions["test-profile"]?.lastQR ? true : false,
-    status: sessions["test-profile"]?.ws?.readyState || "no ws",
+    qr: sessions["test-profile"]?.lastQR ? true : false,
+    pairing: sessions["test-profile"]?.pairCode || null,
   });
 });
 
