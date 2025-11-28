@@ -84,6 +84,13 @@ app.get("/qr", async (req, res) => {
     res.status(500).send(e.message);
   }
 });
+app.get("/debug", (req, res) => {
+  res.json({
+    sessions: Object.keys(sessions),
+    hasQR: sessions["test-profile"]?.lastQR ? true : false,
+    status: sessions["test-profile"]?.ws?.readyState || "no ws"
+  });
+});
 
 
 const PORT = process.env.PORT || 3000;
