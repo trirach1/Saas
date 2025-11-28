@@ -1,35 +1,65 @@
 import express from "express";
-import makeWASocket, { useMultiFileAuthState } from "@whiskeysockets/baileys";
 import QRCode from "qrcode";
+import { Boom } from "@hapi/boom";
+import {
+  makeWASocket,
+  fetchLatestBaileysVersion,
+  useMultiFileAuthState,
+  DisconnectReason
+} from "@whiskeysockets/baileys";
 
 const app = express();
 app.use(express.json());
 
-// GLOBAL SESSIONS STORE
-const sessions = {};
+// IMPORTANT: SESSION STORE
+const sessions = {}; // <-- THIS WAS MISSING !!!
 
-// HEALTH CHECK ENDPOINT
-app.get("/health", (req, res) => {
-  res.status(200).json({ status: "ok" });
-});
+// ---------------- INIT ------------------
 
-// INIT SESSION
 app.post("/init", async (req, res) => {
   try {
-    const { profile } = req.body;
+    const { profile, pairing } = req.body;
+
+    if (!profile) return res.status(400).json({ error: "profile required" });
+
+    console.log("Initializing WhatsApp for:", profile);
 
     const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${profile}`);
 
+    const { version } = await fetchLatestBaileysVersion();
+
     const sock = makeWASocket({
+      version,
       auth: state,
-      printQRInTerminal: false
+      printQRInTerminal: false,
+      syncFullHistory: false,
+      browser: ["Railway", "Chrome", "1.0"],
     });
+
+    sock.lastQR = null;
 
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("connection.update", (update) => {
-      if (update.qr) {
-        sock.lastQR = update.qr;
+      const { qr, connection, lastDisconnect } = update;
+
+      if (qr) {
+        console.log("QR RECEIVED for", profile);
+        sock.lastQR = qr;
+      }
+
+      if (connection === "close") {
+        const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
+
+        console.log("Disconnected:", reason);
+
+        if (reason !== DisconnectReason.loggedOut) {
+          createWhatsAppClient(profile);
+        }
+      }
+
+      if (connection === "open") {
+        console.log("CONNECTED:", profile);
       }
     });
 
@@ -37,61 +67,67 @@ app.post("/init", async (req, res) => {
 
     return res.json({
       success: true,
-      message: "Client initializing",
-      profile
+      message: "client initializing",
+      profile,
     });
+
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error("INIT ERROR:", e);
+    return res.status(500).json({ error: e.message });
   }
 });
 
+// ---------------- QR endpoint ------------------
 
-// RETURN QR CODE
-// QR ENDPOINT (FULLY FIXED)
 app.get("/qr", async (req, res) => {
-  try {
-    const profile = req.query.profile;
+  const profile = req.query.profile;
 
-    if (!profile) return res.status(400).send("profile is required");
-    if (!sessions[profile]) return res.status(404).send("session not initialized");
+  if (!profile) return res.status(400).send("profile required");
 
-    const sock = sessions[profile];
+  const sock = sessions[profile];
 
-    // If QR already exists, send instantly
-    if (sock.lastQR) {
-      const svg = await QRCode.toString(sock.lastQR, { type: "svg" });
-      res.setHeader("Content-Type", "image/svg+xml");
-      return res.send(svg);
-    }
+  if (!sock) return res.status(404).send("session not initialized");
 
-    // Otherwise wait for new QR
-    sock.ev.on("connection.update", async (update) => {
-      if (update.qr) {
-        sock.lastQR = update.qr; // store for next request
-        const svg = await QRCode.toString(update.qr, { type: "svg" });
-        res.setHeader("Content-Type", "image/svg+xml");
-        return res.send(svg);
-      }
-    });
-
-    // Timeout safeguard
-    setTimeout(() => {
-      if (!sock.lastQR) {
-        res.status(408).send("QR timeout");
-      }
-    }, 10000);
-  } catch (e) {
-    res.status(500).send(e.message);
+  if (sock.lastQR) {
+    const svg = await QRCode.toString(sock.lastQR, { type: "svg" });
+    res.setHeader("Content-Type", "image/svg+xml");
+    return res.send(svg);
   }
+
+  // WAIT FOR QR
+  let sent = false;
+  const listener = async (update) => {
+    if (update.qr && !sent) {
+      sent = true;
+      sock.ev.off("connection.update", listener);
+      const svg = await QRCode.toString(update.qr, { type: "svg" });
+      res.setHeader("Content-Type", "image/svg+xml");
+      res.send(svg);
+    }
+  };
+
+  sock.ev.on("connection.update", listener);
+
+  setTimeout(() => {
+    if (!sent) {
+      sock.ev.off("connection.update", listener);
+      res.status(408).send("QR timeout");
+    }
+  }, 10000);
 });
+
+// ---------------- DEBUG ------------------
+
 app.get("/debug", (req, res) => {
   res.json({
     sessions: Object.keys(sessions),
     hasQR: sessions["test-profile"]?.lastQR ? true : false,
-    status: sessions["test-profile"]?.ws?.readyState || "no ws"
+    status: sessions["test-profile"]?.ws?.readyState || "no ws",
   });
 });
 
+// ---------------- HEALTH ------------------
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server running on port", PORT));
+app.get("/health", (req, res) => res.send("OK"));
+
+app.listen(8080, () => console.log("WhatsApp Service running on port 8080"));
