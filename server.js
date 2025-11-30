@@ -1,169 +1,101 @@
 import express from "express";
-import QRCode from "qrcode";
-import { Boom } from "@hapi/boom";
-import {
-  makeWASocket,
+import makeWASocket, {
   fetchLatestBaileysVersion,
-  useMultiFileAuthState,
-  DisconnectReason
+  useMultiFileAuthState
 } from "@whiskeysockets/baileys";
+import pino from "pino";
+import cors from "cors";
 
 const app = express();
 app.use(express.json());
+app.use(cors());
 
-// Store active sessions
 const sessions = {};
 
-
-// ==================================================
-// CREATE WHATSAPP CLIENT
-// ==================================================
-async function createClient(profile, pairing = false) {
-  console.log(`Starting client: ${profile}, pairing: ${pairing}`);
-
-  const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${profile}`);
+async function startClient(profile, phoneNumber) {
+  const { state, saveCreds } = await useMultiFileAuthState(`./auth/${profile}`);
   const { version } = await fetchLatestBaileysVersion();
+
+  console.log(`Starting client: ${profile}, pairing: true`);
 
   const sock = makeWASocket({
     version,
-    auth: state,
     printQRInTerminal: false,
-    browser: ["Chrome", "Safari", "10.0"],
-    // ❌ mobile is removed (deprecated)
-    // mobile: pairing ? true : false,
+    browser: ["TrirachAI", "Chrome", "1.0.0"],
+    auth: state,
+    logger: pino({ level: "silent" })
   });
 
-  sock.lastQR = null;
-  sock.lastPairingCode = null;
-  sock.pairingRequested = false;
-
   sock.ev.on("creds.update", saveCreds);
-  sock.readyForPairing = false;
-
-sock.ev.on("connection.update", async (update) => {
-  const { connection, lastDisconnect, qr, pairingCode } = update;
-
-  if (connection === "open") {
-    console.log(`CONNECTED: ${profile}`);
-    sock.readyForPairing = true; // <-- IMPORTANT
-  }
-
-  if (connection === "close") {
-    sock.readyForPairing = false;
-    const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-    console.log(`Disconnected: ${statusCode}`);
-  }
-
-  if (qr) sock.lastQR = qr;
-  if (pairingCode) sock.lastPairingCode = pairingCode;
-});
 
   sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr, pairingCode } = update;
+    const { connection, lastDisconnect } = update;
 
-    if (qr && !pairing) {
-      console.log(`QR received for ${profile}`);
-      sock.lastQR = qr;
-    }
-
-    if (pairingCode) {
-      console.log("Pairing code received:", pairingCode);
-      sock.lastPairingCode = pairingCode;
+    if (update.qr) {
+      console.log("QR RECEIVED:", profile);
+      sessions[profile].qr = update.qr;
     }
 
     if (connection === "open") {
-      console.log(`CONNECTED: ${profile}`);
+      console.log("Connected to WhatsApp:", profile);
+
+      // REQUEST PAIRING CODE — ONLY IF NO SESSION EXISTS
+      if (!state.creds.registered && phoneNumber) {
+        console.log("Requesting pairing code for:", phoneNumber);
+
+        try {
+          const code = await sock.requestPairingCode(phoneNumber);
+          console.log("PAIRING CODE:", code);
+          sessions[profile].pairing = code;
+        } catch (err) {
+          console.error("PAIRING ERROR:", err);
+        }
+      }
     }
 
     if (connection === "close") {
-      const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      console.log(`Disconnected: ${statusCode}`);
-
-      if (statusCode !== DisconnectReason.loggedOut) {
-        console.log(`Reconnecting ${profile}...`);
-        setTimeout(() => createClient(profile, pairing), 2000);
-      }
+      console.log("Disconnected:", profile);
     }
   });
-  
 
-  sessions[profile] = sock;
-  return sock;
+  sessions[profile] = { client: sock, qr: null, pairing: null };
 }
 
+// --------------------------- API ROUTES ---------------------------
 
-// ==================================================
-// INIT SESSION (QR OR PAIRING)
-// ==================================================
+// INIT CLIENT
 app.post("/init", async (req, res) => {
-  try {
-    const { profile, pairing } = req.body;
+  const { profile, pairing, phone } = req.body;
 
-    if (!profile) return res.status(400).json({ error: "profile required" });
+  if (!profile) return res.json({ error: "profile is required" });
 
-    await createClient(profile, pairing === true);
+  await startClient(profile, phone || null);
 
-    return res.json({
-      success: true,
-      message: "Client initializing",
-      profile
-    });
-  } catch (err) {
-    console.error("INIT ERROR:", err);
-    return res.status(500).json({ error: err.message });
-  }
+  return res.json({
+    success: true,
+    message: "client initializing",
+    profile
+  });
 });
 
-
-// ==================================================
-// GET PAIRING CODE
-// ==================================================
-app.post("/pairing", async (req, res) => {
-  try {
-    const { profile, phone } = req.body;
-
-    if (!profile) return res.status(400).json({ error: "profile required" });
-    if (!phone) return res.status(400).json({ error: "phone required" });
-
-    const sock = sessions[profile];
-    if (!sock) return res.status(404).json({ error: "session not initialized" });
-
-    // ⛔ STOP: Wait until client fully connected
-    if (!sock.readyForPairing) {
-      return res.status(428).json({
-        error: "WhatsApp not ready yet, try again in 2–3 seconds"
-      });
-    }
-
-    console.log("Requesting pairing code for:", phone);
-
-    const code = await sock.requestPairingCode(phone);
-
-    return res.json({ success: true, pairing_code: code });
-  } catch (err) {
-    console.error("PAIRING ERROR:", err);
-    return res.status(500).json({ error: "internal error" });
-  }
-});
-
-
-
-// ==================================================
-// GET QR SVG
-// ==================================================
-app.get("/qr", async (req, res) => {
+// GET QR CODE
+app.get("/qr", (req, res) => {
   const profile = req.query.profile;
-  if (!profile) return res.status(400).send("profile required");
 
-  const sock = sessions[profile];
-  if (!sock) return res.status(404).send("session not initialized");
+  if (!sessions[profile]) return res.send("Client not initialized");
+  if (sessions[profile].qr) return res.send(sessions[profile].qr);
 
-  if (!sock.lastQR) return res.status(404).send("No QR available yet");
+  res.send("No QR available yet");
+});
 
-  const svg = await QRCode.toString(sock.lastQR, { type: "svg" });
+// GET PAIRING CODE
+app.get("/pairing", (req, res) => {
+  const profile = req.query.profile;
 
-  res.setHeader("Content-Type", "image/svg+xml");
-  return res.send(svg);
+  if (!sessions[profile]) return res.send("Client not initialized");
+  if (sessions[profile].pairing) return res.send(sessions[profile].pairing);
+
+  res.send("Pairing code not ready");
 });
 
 
