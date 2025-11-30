@@ -38,6 +38,25 @@ async function createClient(profile, pairing = false) {
   sock.pairingRequested = false;
 
   sock.ev.on("creds.update", saveCreds);
+  sock.readyForPairing = false;
+
+sock.ev.on("connection.update", async (update) => {
+  const { connection, lastDisconnect, qr, pairingCode } = update;
+
+  if (connection === "open") {
+    console.log(`CONNECTED: ${profile}`);
+    sock.readyForPairing = true; // <-- IMPORTANT
+  }
+
+  if (connection === "close") {
+    sock.readyForPairing = false;
+    const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
+    console.log(`Disconnected: ${statusCode}`);
+  }
+
+  if (qr) sock.lastQR = qr;
+  if (pairingCode) sock.lastPairingCode = pairingCode;
+});
 
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr, pairingCode } = update;
@@ -66,6 +85,7 @@ async function createClient(profile, pairing = false) {
       }
     }
   });
+  
 
   sessions[profile] = sock;
   return sock;
@@ -108,23 +128,24 @@ app.post("/pairing", async (req, res) => {
     const sock = sessions[profile];
     if (!sock) return res.status(404).json({ error: "session not initialized" });
 
+    // ⛔ STOP: Wait until client fully connected
+    if (!sock.readyForPairing) {
+      return res.status(428).json({
+        error: "WhatsApp not ready yet, try again in 2–3 seconds"
+      });
+    }
+
     console.log("Requesting pairing code for:", phone);
 
-    let code;
-
-    try {
-      code = await sock.requestPairingCode(phone);
-    } catch (err) {
-      console.log("PAIRING ERROR:", err);
-      return res.status(428).json({ error: "Connection not ready yet" });
-    }
+    const code = await sock.requestPairingCode(phone);
 
     return res.json({ success: true, pairing_code: code });
   } catch (err) {
     console.error("PAIRING ERROR:", err);
-    return res.status(500).json({ error: "Internal error" });
+    return res.status(500).json({ error: "internal error" });
   }
 });
+
 
 
 // ==================================================
