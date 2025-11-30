@@ -35,7 +35,7 @@ async function createClient(profile, pairing = false) {
     syncFullHistory: false,
     // Use WhatsApp mobile-style session when using pairing codes
     browser: pairing ? ["Android", "Chrome", "2.0"] : ["Web", "Chrome", "1.0"],
-    mobile: pairing,
+    mobile: false,
   });
 
   sock.lastQR = null;
