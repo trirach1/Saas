@@ -218,13 +218,13 @@ app.post("/pairing", async (req, res) => {
     const sock = sessions[profile];
     if (!sock) return res.status(404).json({ error: "session not initialized" });
 
-    // Clean and log phone number in international format (digits only)
-    const cleanPhone = String(phone).replace(/\D/g, '');
-    console.log("Requesting pairing code for:", cleanPhone);
+    if (!sock.isReady) {
+      return res.status(409).json({ error: "WhatsApp not connected yet, retry in 2 seconds." });
+    }
 
-    const code = await sock.requestPairingCode(cleanPhone);
+    console.log("Requesting pairing code for:", phone);
 
-    if (!code) return res.status(500).json({ error: "failed to generate pairing code" });
+    const code = await sock.requestPairingCode(phone);
 
     return res.json({ success: true, pairing_code: code });
 
@@ -233,6 +233,7 @@ app.post("/pairing", async (req, res) => {
     return res.status(500).json({ error: e.message });
   }
 });
+
 
 // -------------------------------------------
 // QR ENDPOINT
