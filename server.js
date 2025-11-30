@@ -10,6 +10,11 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+// ❤️ HEALTHCHECK FOR RAILWAY / DOCKER / LOAD BALANCERS
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "ok" });
+});
+
 const sessions = {};
 
 async function startClient(profile, phoneNumber) {
@@ -29,7 +34,7 @@ async function startClient(profile, phoneNumber) {
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect } = update;
+    const { connection } = update;
 
     if (update.qr) {
       console.log("QR RECEIVED:", profile);
@@ -39,7 +44,6 @@ async function startClient(profile, phoneNumber) {
     if (connection === "open") {
       console.log("Connected to WhatsApp:", profile);
 
-      // REQUEST PAIRING CODE — ONLY IF NO SESSION EXISTS
       if (!state.creds.registered && phoneNumber) {
         console.log("Requesting pairing code for:", phoneNumber);
 
@@ -61,11 +65,8 @@ async function startClient(profile, phoneNumber) {
   sessions[profile] = { client: sock, qr: null, pairing: null };
 }
 
-// --------------------------- API ROUTES ---------------------------
-
-// INIT CLIENT
 app.post("/init", async (req, res) => {
-  const { profile, pairing, phone } = req.body;
+  const { profile, phone } = req.body;
 
   if (!profile) return res.json({ error: "profile is required" });
 
@@ -78,7 +79,6 @@ app.post("/init", async (req, res) => {
   });
 });
 
-// GET QR CODE
 app.get("/qr", (req, res) => {
   const profile = req.query.profile;
 
@@ -88,7 +88,6 @@ app.get("/qr", (req, res) => {
   res.send("No QR available yet");
 });
 
-// GET PAIRING CODE
 app.get("/pairing", (req, res) => {
   const profile = req.query.profile;
 
@@ -98,18 +97,6 @@ app.get("/pairing", (req, res) => {
   res.send("Pairing code not ready");
 });
 
-
-// ==================================================
-// HEALTHCHECK FOR RAILWAY
-// ==================================================
-app.get("/health", (req, res) => res.send("OK"));
-
-
-// ==================================================
-// START SERVER
-// ==================================================
-const PORT = process.env.PORT || 8080;
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`WhatsApp Service running on port ${PORT}`);
+app.listen(8080, () => {
+  console.log("WhatsApp Service running on port 8080");
 });
