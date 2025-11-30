@@ -151,9 +151,9 @@ app.get("/debug", (req, res) => {
 // ==================================================
 // HEALTHCHECK (REQUIRED FOR RAILWAY)
 // ==================================================
-app.get("/", (req, res) => {
-  res.send("OK");
-});
+
+// HEALTH
+app.get("/health", (req, res) => res.send("OK"));
 
 // ==================================================
 // SERVER START
