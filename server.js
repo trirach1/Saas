@@ -295,45 +295,88 @@ app.post("/send-message", async (req, res) => {
   try {
     const { profile, to, message } = req.body;
 
-    if (!profile) return res.status(400).json({ success: false, error: "profile required" });
-    if (!to) return res.status(400).json({ success: false, error: "to (recipient) required" });
-    if (!message) return res.status(400).json({ success: false, error: "message required" });
+    if (!profile) {
+      return res.status(200).json({ success: false, error: "profile required" });
+    }
+    if (!to) {
+      return res.status(200).json({ success: false, error: "to (recipient) required" });
+    }
+    if (!message) {
+      return res.status(200).json({ success: false, error: "message required" });
+    }
 
-    const sock = sessions[profile];
+    let sock = sessions[profile];
+
+    // If there's no active session in memory, try to restore it from saved credentials
     if (!sock) {
-      return res.status(404).json({ 
-        success: false, 
-        error: "session not found - please initialize connection first" 
+      console.log("No active session for profile, attempting to restore:", profile);
+      try {
+        sock = await createClient(profile, false);
+      } catch (err) {
+        console.error("Failed to restore session for profile", profile, err);
+        return res.status(200).json({
+          success: false,
+          error: "session not found - please re-connect WhatsApp Web on the dashboard"
+        });
+      }
+    }
+
+    if (!sock) {
+      return res.status(200).json({
+        success: false,
+        error: "session not found after restore - please re-connect WhatsApp Web"
       });
     }
 
     // Check if connected
     if (connectionStatus[profile] !== "open") {
-      return res.status(503).json({ 
-        success: false, 
-        error: "session not connected - please check connection status" 
+      console.log("Session exists but is not connected:", profile, connectionStatus[profile]);
+      return res.status(200).json({
+        success: false,
+        error: "session not connected - please open WhatsApp Web and wait for it to connect"
       });
     }
 
-    console.log(`Sending message to ${to} via profile ${profile}`);
+    // Normalize recipient to proper WhatsApp JID
+    let jid = to;
+    try {
+      const [rawNumber] = String(to).split("@");
+      const digits = String(rawNumber).replace(/\D/g, "");
 
-    // Send the message
-    await sock.sendMessage(to, { text: message });
+      if (!digits) {
+        console.error("Invalid recipient phone number:", to);
+        return res.status(200).json({
+          success: false,
+          error: "invalid recipient phone number"
+        });
+      }
 
-    console.log(`Message sent successfully to ${to}`);
+      jid = `${digits}@s.whatsapp.net`;
+    } catch (normErr) {
+      console.error("Error normalizing recipient number:", normErr);
+      return res.status(200).json({
+        success: false,
+        error: "failed to normalize recipient number"
+      });
+    }
 
-    return res.json({ 
-      success: true, 
+    console.log(`Sending message to ${jid} via profile ${profile}`);
+
+    await sock.sendMessage(jid, { text: message });
+
+    console.log(`Message sent successfully to ${jid}`);
+
+    return res.status(200).json({
+      success: true,
       message: "Message sent successfully",
-      to,
+      to: jid,
       profile
     });
-
   } catch (e) {
     console.error("SEND MESSAGE ERROR:", e);
-    return res.status(500).json({ 
-      success: false, 
-      error: e.message || "Failed to send message" 
+    return res.status(200).json({
+      success: false,
+      error: e.message || "Failed to send message"
     });
   }
 });
