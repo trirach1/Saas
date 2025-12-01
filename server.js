@@ -25,16 +25,7 @@ const RECONNECT_DELAY = 5000;
 async function createClient(profile, pairing = false) {
   console.log("Starting client:", profile, "pairing:", pairing);
 
-  // Ensure sessions directory exists
-  const sessionPath = `./sessions/${profile}`;
-  if (!fs.existsSync('./sessions')) {
-    fs.mkdirSync('./sessions', { recursive: true });
-  }
-  if (!fs.existsSync(sessionPath)) {
-    fs.mkdirSync(sessionPath, { recursive: true });
-  }
-
-  const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+  const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${profile}`);
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
@@ -136,10 +127,7 @@ async function createClient(profile, pairing = false) {
 
     if (connection === "close") {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      console.log("Disconnected:", reason, "for profile:", profile);
-      
-      // Mark connection as closed but keep session alive for status checks
-      connectionStatus[profile] = "closed";
+      console.log("Disconnected:", reason);
 
       if (reason === DisconnectReason.loggedOut) {
         console.log("Logged out, cleaning session:", profile);
@@ -160,8 +148,8 @@ async function createClient(profile, pairing = false) {
 
       if (reconnectAttempts[profile] >= MAX_RECONNECT_ATTEMPTS) {
         console.log("Max reconnect attempts reached for:", profile);
-        // Keep session alive but mark as closed - don't delete it
-        console.log("Session kept alive for future status checks");
+        delete connectedPhones[profile];
+        delete connectionStatus[profile];
         return;
       }
 
@@ -174,14 +162,13 @@ async function createClient(profile, pairing = false) {
         if (fs.existsSync(sessionPath)) {
           fs.rmSync(sessionPath, { recursive: true, force: true });
         }
-        // Don't delete session object - just recreate client
         delete connectedPhones[profile];
+        delete connectionStatus[profile];
         
         setTimeout(() => {
           createClient(profile, pairing);
         }, RECONNECT_DELAY * 3);
       } else {
-        // For normal disconnections, try to reconnect without deleting session
         setTimeout(() => {
           createClient(profile, pairing);
         }, RECONNECT_DELAY * reconnectAttempts[profile]);
@@ -201,36 +188,12 @@ app.post("/init", async (req, res) => {
     const { profile, pairing } = req.body;
     if (!profile) return res.status(400).json({ error: "profile required" });
 
-    console.log("Initializing session for profile:", profile, "pairing:", pairing);
-
-    // Reset reconnect attempts when reinitializing
-    reconnectAttempts[profile] = 0;
-    
-    // If session exists and is connected, don't recreate - just return success
-    if (sessions[profile] && connectionStatus[profile] === "open") {
-      console.log("Session already connected, skipping recreation");
-      return res.json({ success: true, message: "client already connected", profile });
-    }
-
-    // Clean up existing session if present
+    // Clean up existing session
     if (sessions[profile]) {
-      console.log("Cleaning up existing session before reinit");
-      try {
-        sessions[profile].end();
-      } catch (e) {
-        console.log("Error ending existing session:", e.message);
-      }
+      sessions[profile].end();
       delete sessions[profile];
-      delete connectionStatus[profile];
-      delete connectedPhones[profile];
     }
-
-    // Clear old session files if they exist - force fresh start on init
-    const sessionPath = `./sessions/${profile}`;
-    if (fs.existsSync(sessionPath)) {
-      console.log("Removing old session files for fresh start");
-      fs.rmSync(sessionPath, { recursive: true, force: true });
-    }
+    reconnectAttempts[profile] = 0;
 
     await createClient(profile, pairing === true);
 
@@ -300,12 +263,7 @@ app.get("/status", (req, res) => {
   if (!profile) return res.status(400).json({ error: "profile required" });
 
   const sock = sessions[profile];
-  
-  // Check if we have connection status tracked even if session is gone
-  const hasTrackedStatus = connectionStatus[profile] !== undefined;
-  const isConnected = connectionStatus[profile] === "open";
-  
-  if (!sock && !hasTrackedStatus) {
+  if (!sock) {
     return res.status(404).json({ 
       error: "session not found",
       connected: false,
@@ -313,23 +271,9 @@ app.get("/status", (req, res) => {
     });
   }
 
-  // If session is gone but we have tracked status, report it
-  if (!sock && hasTrackedStatus) {
-    return res.json({
-      success: true,
-      connected: isConnected,
-      exists: false, // Session object is gone
-      connection: isConnected ? "open" : "closed",
-      phone: connectedPhones[profile] || null,
-      hasQR: false,
-      hasPairing: false,
-      qr: false,
-      pairing: null,
-      reconnectAttempts: reconnectAttempts[profile] || 0
-    });
-  }
+  // Use the tracked connection status instead of WebSocket state
+  const isConnected = connectionStatus[profile] === "open";
 
-  // Normal case: session exists
   return res.json({
     success: true,
     connected: isConnected,
@@ -382,16 +326,5 @@ app.get("/debug", (req, res) => {
 
 // HEALTH
 app.get("/health", (req, res) => res.send("OK"));
-
-// Global error handlers to keep service running
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', error);
-  // Don't exit - keep service running
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  // Don't exit - keep service running
-});
 
 app.listen(8080, "0.0.0.0", () => console.log("WhatsApp Service running on port 8080"));
