@@ -289,6 +289,56 @@ app.get("/status", (req, res) => {
 });
 
 // -------------------------------------------
+// SEND MESSAGE ENDPOINT (for order confirmations and other programmatic messages)
+// -------------------------------------------
+app.post("/send-message", async (req, res) => {
+  try {
+    const { profile, to, message } = req.body;
+
+    if (!profile) return res.status(400).json({ success: false, error: "profile required" });
+    if (!to) return res.status(400).json({ success: false, error: "to (recipient) required" });
+    if (!message) return res.status(400).json({ success: false, error: "message required" });
+
+    const sock = sessions[profile];
+    if (!sock) {
+      return res.status(404).json({ 
+        success: false, 
+        error: "session not found - please initialize connection first" 
+      });
+    }
+
+    // Check if connected
+    if (connectionStatus[profile] !== "open") {
+      return res.status(503).json({ 
+        success: false, 
+        error: "session not connected - please check connection status" 
+      });
+    }
+
+    console.log(`Sending message to ${to} via profile ${profile}`);
+
+    // Send the message
+    await sock.sendMessage(to, { text: message });
+
+    console.log(`Message sent successfully to ${to}`);
+
+    return res.json({ 
+      success: true, 
+      message: "Message sent successfully",
+      to,
+      profile
+    });
+
+  } catch (e) {
+    console.error("SEND MESSAGE ERROR:", e);
+    return res.status(500).json({ 
+      success: false, 
+      error: e.message || "Failed to send message" 
+    });
+  }
+});
+
+// -------------------------------------------
 // DISCONNECT ENDPOINT
 // -------------------------------------------
 app.post("/disconnect", (req, res) => {
@@ -314,7 +364,9 @@ app.post("/disconnect", (req, res) => {
   return res.json({ success: true, message: "session disconnected" });
 });
 
-// DEBUG
+// -------------------------------------------
+// DEBUG ENDPOINT
+// -------------------------------------------
 app.get("/debug", (req, res) => {
   res.json({
     sessions: Object.keys(sessions),
@@ -324,7 +376,9 @@ app.get("/debug", (req, res) => {
   });
 });
 
-// HEALTH
+// -------------------------------------------
+// HEALTH CHECK
+// -------------------------------------------
 app.get("/health", (req, res) => res.send("OK"));
 
 app.listen(8080, "0.0.0.0", () => console.log("WhatsApp Service running on port 8080"));
