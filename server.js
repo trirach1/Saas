@@ -38,59 +38,25 @@ async function createClient(profile, pairing = false) {
     mobile: false,
   });
 
-  // Handle incoming messages - CORRECTED version
-sock.ev.on("messages.upsert", async ({ messages, type }) => {
-  console.log("Messages received:", type, "count:", messages.length);
-  
-  for (const msg of messages) {
-    if (msg.key.fromMe) {
-      console.log("Skipping own message");
-      continue;
-    }
+  sock.lastQR = null;
+  sock.lastPairingCode = null;
 
-    const messageText = msg.message?.conversation || 
-                        msg.message?.extendedTextMessage?.text ||
-                        msg.message?.imageMessage?.caption ||
-                        msg.message?.videoMessage?.caption ||
-                        null;
-    
-    if (!messageText) {
-      console.log("Skipping message without text content");
-      continue;
-    }
+  sock.ev.on("creds.update", saveCreds);
 
-    const from = msg.key.remoteJid;
-    console.log(`New message from ${from}: ${messageText}`);
+  // Handle incoming messages
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    console.log("Messages received:", type);
+    
+    for (const msg of messages) {
+      // Skip if message is from us or has no text
+      if (msg.key.fromMe || !msg.message?.conversation) {
+        continue;
+      }
 
-    try {
-      const supabaseUrl = process.env.SUPABASE_URL || 'https://hrshudfqrjyrgppkiaas.supabase.co';
-      const webhookUrl = `${supabaseUrl}/functions/v1/whatsapp-web-message`;
-      
-      const response = await fetch(webhookUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profile, from, message: messageText, messageId: msg.key.id })
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        
-        // Only check connection when SENDING reply
-        if (data.reply) {
-          try {
-            await sock.sendMessage(from, { text: data.reply });
-            console.log(`Sent reply to ${from}`);
-          } catch (sendErr) {
-            console.error('Send failed, connection may have dropped:', sendErr.message);
-          }
-        }
-      }
-    } catch (error) {
-      console.error('Error processing message:', error.message);
-    }
-  }
-});
-
+      const from = msg.key.remoteJid; // sender's number
+      const messageText = msg.message.conversation;
+      
+      console.log(`New message from ${from}: ${messageText}`);
 
       try {
         // Forward to Supabase edge function for AI processing
