@@ -38,23 +38,30 @@ async function createClient(profile, pairing = false) {
     mobile: false,
   });
 
-  sock.lastQR = null;
-  sock.lastPairingCode = null;
-
-  sock.ev.on("creds.update", saveCreds);
-
-  // Handle incoming messages
+    // Handle incoming messages
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    console.log("Messages received:", type);
+    console.log("Messages received:", type, "count:", messages.length);
     
     for (const msg of messages) {
-      // Skip if message is from us or has no text
-      if (msg.key.fromMe || !msg.message?.conversation) {
+      // Skip if message is from us
+      if (msg.key.fromMe) {
+        console.log("Skipping own message");
+        continue;
+      }
+
+      // Extract text from various message formats
+      const messageText = msg.message?.conversation || 
+                          msg.message?.extendedTextMessage?.text ||
+                          msg.message?.imageMessage?.caption ||
+                          msg.message?.videoMessage?.caption ||
+                          null;
+      
+      if (!messageText) {
+        console.log("Skipping message without text content:", JSON.stringify(msg.message));
         continue;
       }
 
       const from = msg.key.remoteJid; // sender's number
-      const messageText = msg.message.conversation;
       
       console.log(`New message from ${from}: ${messageText}`);
 
