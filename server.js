@@ -1,250 +1,365 @@
-import express from "express";
-import QRCode from "qrcode";
-import { Boom } from "@hapi/boom";
-import fs from "fs";
-import {
-  makeWASocket,
-  fetchLatestBaileysVersion,
-  useMultiFileAuthState,
-  DisconnectReason
-} from "@whiskeysockets/baileys";
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const express = require('express');
+const cors = require('cors');
+const pino = require('pino');
+const NodeCache = require('node-cache');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
+app.use(cors());
 app.use(express.json());
 
-const sessions = {};
-const reconnectAttempts = {};
-const connectedPhones = {};
-const connectionStatus = {};
-const MAX_RECONNECT_ATTEMPTS = 3;
-const RECONNECT_DELAY = 5000;
+const logger = pino({ level: 'silent' });
+const msgRetryCounterCache = new NodeCache();
 
-async function createClient(profile, pairing = false) {
-  console.log("Starting client:", profile, "pairing:", pairing);
+// Environment variables
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const PORT = process.env.PORT || 3000;
 
-  const sessionPath = `./sessions/${profile}`;
-  if (!fs.existsSync(sessionPath)) {
-    fs.mkdirSync(sessionPath, { recursive: true });
+// Store active connections
+const connections = new Map();
+
+// Helper to call edge function
+async function callEdgeFunction(action, data) {
+  try {
+    const response = await fetch(`${SUPABASE_URL}/functions/v1/whatsapp-session-persist`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        'apikey': SUPABASE_ANON_KEY
+      },
+      body: JSON.stringify({ action, ...data })
+    });
+    return await response.json();
+  } catch (error) {
+    console.error(`Edge function error (${action}):`, error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+// Save session to database
+async function saveSessionToDb(profileId, sessionData, connectedPhone) {
+  console.log(`Saving session for profile: ${profileId}`);
+  return await callEdgeFunction('save', { profileId, sessionData, connectedPhone });
+}
+
+// Get session from database
+async function getSessionFromDb(profileId) {
+  console.log(`Loading session for profile: ${profileId}`);
+  const result = await callEdgeFunction('get', { profileId });
+  if (result.success && result.sessionData) {
+    return result.sessionData;
+  }
+  return null;
+}
+
+// Delete session from database
+async function deleteSessionFromDb(profileId) {
+  console.log(`Deleting session for profile: ${profileId}`);
+  return await callEdgeFunction('delete', { profileId });
+}
+
+// Initialize WhatsApp connection
+async function initializeWhatsApp(profileId) {
+  const authDir = path.join(__dirname, 'auth_sessions', profileId);
+  
+  // Try to restore session from database first
+  const savedSession = await getSessionFromDb(profileId);
+  if (savedSession) {
+    try {
+      if (!fs.existsSync(authDir)) {
+        fs.mkdirSync(authDir, { recursive: true });
+      }
+      // Write session files
+      if (savedSession.creds) {
+        fs.writeFileSync(path.join(authDir, 'creds.json'), JSON.stringify(savedSession.creds));
+      }
+      if (savedSession.keys) {
+        for (const [filename, content] of Object.entries(savedSession.keys)) {
+          fs.writeFileSync(path.join(authDir, filename), JSON.stringify(content));
+        }
+      }
+      console.log(`Session restored from database for ${profileId}`);
+    } catch (err) {
+      console.error('Error restoring session:', err);
+    }
   }
 
-  const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
     version,
-    auth: state,
+    logger,
     printQRInTerminal: false,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, logger)
+    },
+    msgRetryCounterCache,
+    generateHighQualityLinkPreview: true,
     syncFullHistory: false,
-    browser: pairing ? ["Android", "Chrome", "2.0"] : ["Web", "Chrome", "1.0"],
-    mobile: false,
+    markOnlineOnConnect: false
   });
 
-  sock.lastQR = null;
-  sock.lastPairingCode = null;
+  const connectionData = {
+    socket: sock,
+    qrCode: null,
+    pairingCode: null,
+    status: 'connecting',
+    connectedPhone: null,
+    profileId
+  };
 
-  sock.ev.on("creds.update", saveCreds);
+  connections.set(profileId, connectionData);
 
-  sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    console.log("Messages received:", type, "count:", messages.length);
+  // Handle credentials update - save to database
+  sock.ev.on('creds.update', async () => {
+    await saveCreds();
+    
+    // Read and save to database
+    try {
+      const credsPath = path.join(authDir, 'creds.json');
+      if (fs.existsSync(credsPath)) {
+        const creds = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
+        const keys = {};
+        const files = fs.readdirSync(authDir).filter(f => f !== 'creds.json');
+        for (const file of files) {
+          try {
+            keys[file] = JSON.parse(fs.readFileSync(path.join(authDir, file), 'utf-8'));
+          } catch (e) {}
+        }
+        await saveSessionToDb(profileId, { creds, keys }, connectionData.connectedPhone);
+      }
+    } catch (err) {
+      console.error('Error saving session to database:', err);
+    }
+  });
+
+  // Handle connection updates
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+    const conn = connections.get(profileId);
+
+    if (qr && conn) {
+      conn.qrCode = qr;
+      conn.status = 'waiting_for_qr';
+      
+      // Generate pairing code for phone number login
+      if (!conn.pairingCode && sock.authState?.creds?.me?.id === undefined) {
+        try {
+          const phoneNumber = conn.requestedPhone?.replace(/[^0-9]/g, '');
+          if (phoneNumber && phoneNumber.length >= 10) {
+            const code = await sock.requestPairingCode(phoneNumber);
+            conn.pairingCode = code;
+            console.log(`Pairing code for ${profileId}: ${code}`);
+          }
+        } catch (err) {
+          console.log('Pairing code generation skipped:', err.message);
+        }
+      }
+    }
+
+    if (connection === 'open' && conn) {
+      conn.status = 'connected';
+      conn.qrCode = null;
+      conn.pairingCode = null;
+      conn.connectedPhone = sock.user?.id?.split(':')[0] || sock.user?.id;
+      console.log(`WhatsApp connected for ${profileId}: ${conn.connectedPhone}`);
+      
+      // Notify webhook about connection
+      notifyWebhook(profileId, 'connected', { phone: conn.connectedPhone });
+    }
+
+    if (connection === 'close') {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const reason = DisconnectReason[Object.keys(DisconnectReason).find(k => DisconnectReason[k] === statusCode)] || statusCode;
+      
+      console.log(`Connection closed for ${profileId}: ${reason} (${statusCode})`);
+
+      if (statusCode === DisconnectReason.loggedOut) {
+        // User logged out - clear session
+        await deleteSessionFromDb(profileId);
+        if (fs.existsSync(authDir)) {
+          fs.rmSync(authDir, { recursive: true, force: true });
+        }
+        connections.delete(profileId);
+        notifyWebhook(profileId, 'disconnected', { reason: 'logged_out' });
+      } else if (statusCode !== DisconnectReason.connectionClosed) {
+        // Reconnect for other errors
+        console.log(`Reconnecting ${profileId} in 3 seconds...`);
+        setTimeout(() => initializeWhatsApp(profileId), 3000);
+      }
+    }
+  });
+
+  // Handle incoming messages
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
     
     for (const msg of messages) {
       if (msg.key.fromMe) continue;
-
-      const messageText = msg.message?.conversation || 
-                          msg.message?.extendedTextMessage?.text ||
-                          msg.message?.imageMessage?.caption ||
-                          msg.message?.videoMessage?.caption ||
-                          null;
       
-      if (!messageText) continue;
-
       const from = msg.key.remoteJid;
-      console.log(`New message from ${from}: ${messageText}`);
-
-      try {
-        const supabaseUrl = process.env.SUPABASE_URL || 'https://hrshudfqrjyrgppkiaas.supabase.co';
-        const response = await fetch(`${supabaseUrl}/functions/v1/whatsapp-web-message`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ profile, from, message: messageText, messageId: msg.key.id })
-        });
-
-        if (response.ok) {
-          const data = await response.json();
-          if (data.reply) {
-            try {
-              await sock.sendMessage(from, { text: data.reply });
-              console.log(`Sent reply to ${from}`);
-            } catch (sendErr) {
-              console.error('Send failed:', sendErr.message);
-            }
-          }
-        }
-      } catch (error) {
-        console.error('Error processing message:', error.message);
+      const text = msg.message?.conversation || 
+                   msg.message?.extendedTextMessage?.text || 
+                   msg.message?.imageMessage?.caption || '';
+      
+      if (text) {
+        console.log(`Message from ${from}: ${text}`);
+        // Forward to AI processing
+        await processIncomingMessage(profileId, from, text, msg);
       }
     }
   });
 
-  sock.ev.on("connection.update", async (update) => {
-    const { qr, connection, lastDisconnect, pairingCode } = update;
-
-    if (qr) {
-      console.log("QR received:", profile);
-      sock.lastQR = qr;
-      reconnectAttempts[profile] = 0;
-    }
-
-    if (pairingCode) {
-      console.log("PAIRING CODE:", pairingCode);
-      sock.lastPairingCode = pairingCode;
-      reconnectAttempts[profile] = 0;
-    }
-
-    if (connection === "open") {
-      console.log("CONNECTED:", profile);
-      reconnectAttempts[profile] = 0;
-      connectionStatus[profile] = "open";
-      try {
-        const phoneNumber = sock.user?.id?.split(':')[0] || sock.user?.id;
-        if (phoneNumber) connectedPhones[profile] = phoneNumber;
-      } catch (e) {}
-    }
-
-    if (connection === "close") {
-      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      console.log("Disconnected:", reason);
-      connectionStatus[profile] = "closed";
-
-      if (reason === DisconnectReason.loggedOut || reason === 428) {
-        const sp = `./sessions/${profile}`;
-        if (fs.existsSync(sp)) fs.rmSync(sp, { recursive: true, force: true });
-        delete sessions[profile];
-        delete reconnectAttempts[profile];
-        delete connectedPhones[profile];
-        delete connectionStatus[profile];
-        return;
-      }
-
-      if (!reconnectAttempts[profile]) reconnectAttempts[profile] = 0;
-      if (reconnectAttempts[profile] >= MAX_RECONNECT_ATTEMPTS) return;
-
-      reconnectAttempts[profile]++;
-      setTimeout(() => createClient(profile, pairing), RECONNECT_DELAY * reconnectAttempts[profile]);
-    }
-  });
-
-  sessions[profile] = sock;
-  return sock;
+  return connectionData;
 }
 
-app.post("/init", async (req, res) => {
+// Notify Supabase webhook about status changes
+async function notifyWebhook(profileId, event, data) {
   try {
-    const { profile, pairing } = req.body;
-    if (!profile) return res.status(400).json({ error: "profile required" });
-
-    if (sessions[profile]) {
-      try { sessions[profile].end(); } catch (e) {}
-      delete sessions[profile];
-    }
-    reconnectAttempts[profile] = 0;
-
-    await createClient(profile, pairing === true);
-    return res.json({ success: true, message: "client initializing", profile });
-  } catch (e) {
-    return res.status(500).json({ error: e.message });
+    await fetch(`${SUPABASE_URL}/functions/v1/whatsapp-web-webhook`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        'apikey': SUPABASE_ANON_KEY
+      },
+      body: JSON.stringify({ profileId, event, data })
+    });
+  } catch (err) {
+    console.error('Webhook notification failed:', err.message);
   }
-});
+}
 
-app.post("/pairing", async (req, res) => {
+// Process incoming messages
+async function processIncomingMessage(profileId, from, text, rawMessage) {
   try {
-    const { profile, phone } = req.body;
-    if (!profile) return res.status(400).json({ error: "profile required" });
-    if (!phone) return res.status(400).json({ error: "phone required" });
-
-    const sock = sessions[profile];
-    if (!sock) return res.status(404).json({ error: "session not initialized" });
-
-    const cleanPhone = String(phone).replace(/\D/g, '');
-    const code = await sock.requestPairingCode(cleanPhone);
-    return res.json({ success: true, pairing_code: code });
-  } catch (e) {
-    return res.status(500).json({ error: e.message });
+    await fetch(`${SUPABASE_URL}/functions/v1/whatsapp-web-message`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        'apikey': SUPABASE_ANON_KEY
+      },
+      body: JSON.stringify({ profileId, from, text, messageId: rawMessage.key.id })
+    });
+  } catch (err) {
+    console.error('Message processing failed:', err.message);
   }
+}
+
+// REST API Endpoints
+
+// Initialize connection
+app.post('/init', async (req, res) => {
+  const { profileId, phoneNumber } = req.body;
+  
+  if (!profileId) {
+    return res.status(400).json({ error: 'profileId required' });
+  }
+
+  let conn = connections.get(profileId);
+  if (conn && conn.status === 'connected') {
+    return res.json({ success: true, status: 'already_connected', phone: conn.connectedPhone });
+  }
+
+  conn = await initializeWhatsApp(profileId);
+  if (phoneNumber) {
+    conn.requestedPhone = phoneNumber;
+  }
+
+  res.json({ success: true, status: 'initializing' });
 });
 
-app.get("/qr", async (req, res) => {
-  const profile = req.query.profile;
-  if (!profile) return res.status(400).json({ error: "profile required" });
-  const sock = sessions[profile];
-  if (!sock) return res.status(404).json({ error: "session not initialized" });
-  if (sock.lastQR) {
-    const svg = await QRCode.toString(sock.lastQR, { type: "svg" });
-    res.setHeader("Content-Type", "image/svg+xml");
-    return res.send(svg);
+// Get connection status
+app.get('/status', (req, res) => {
+  const { profileId } = req.query;
+  
+  if (!profileId) {
+    return res.status(400).json({ error: 'profileId required' });
   }
-  return res.status(404).json({ error: "QR not ready" });
-});
 
-app.get("/status", (req, res) => {
-  const profile = req.query.profile;
-  if (!profile) return res.status(400).json({ error: "profile required" });
-  const sock = sessions[profile];
-  if (!sock) return res.json({ connected: false, exists: false });
-  return res.json({
-    success: true,
-    connected: connectionStatus[profile] === "open",
-    exists: true,
-    phone: connectedPhones[profile] || null,
-    hasQR: !!sock.lastQR,
-    hasPairing: !!sock.lastPairingCode,
-    pairing: sock.lastPairingCode || null
+  const conn = connections.get(profileId);
+  if (!conn) {
+    return res.json({ status: 'not_initialized' });
+  }
+
+  res.json({
+    status: conn.status,
+    qrCode: conn.qrCode,
+    pairingCode: conn.pairingCode,
+    connectedPhone: conn.connectedPhone
   });
 });
 
-app.post("/send-message", async (req, res) => {
+// Send message
+app.post('/send', async (req, res) => {
+  const { profileId, to, message } = req.body;
+  
+  if (!profileId || !to || !message) {
+    return res.status(400).json({ error: 'profileId, to, and message required' });
+  }
+
+  const conn = connections.get(profileId);
+  if (!conn || conn.status !== 'connected') {
+    return res.status(400).json({ error: 'Not connected' });
+  }
+
   try {
-    const { profile, to, message } = req.body;
-    if (!profile || !to || !message) return res.json({ success: false, error: "missing params" });
-
-    let sock = sessions[profile];
-    if (!sock) {
-      try { sock = await createClient(profile, false); } 
-      catch (e) { return res.json({ success: false, error: "session not found" }); }
-    }
-    if (connectionStatus[profile] !== "open") {
-      return res.json({ success: false, error: "not connected" });
-    }
-
-    const digits = String(to).replace(/\D/g, "");
-    const jid = `${digits}@s.whatsapp.net`;
-    await sock.sendMessage(jid, { text: message });
-    return res.json({ success: true, to: jid });
-  } catch (e) {
-    return res.json({ success: false, error: e.message });
+    const jid = to.includes('@') ? to : `${to.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
+    await conn.socket.sendMessage(jid, { text: message });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-app.post("/disconnect", (req, res) => {
-  const { profile } = req.body;
-  if (!profile) return res.status(400).json({ error: "profile required" });
-  const sock = sessions[profile];
-  if (sock) {
-    try { sock.end(); } catch (e) {}
-    delete sessions[profile];
+// Disconnect
+app.post('/disconnect', async (req, res) => {
+  const { profileId } = req.body;
+  
+  if (!profileId) {
+    return res.status(400).json({ error: 'profileId required' });
   }
-  delete reconnectAttempts[profile];
-  delete connectedPhones[profile];
-  delete connectionStatus[profile];
-  const sp = `./sessions/${profile}`;
-  if (fs.existsSync(sp)) fs.rmSync(sp, { recursive: true, force: true });
-  return res.json({ success: true });
+
+  const conn = connections.get(profileId);
+  if (conn) {
+    try {
+      await conn.socket.logout();
+    } catch (err) {}
+    connections.delete(profileId);
+    await deleteSessionFromDb(profileId);
+  }
+
+  res.json({ success: true });
 });
 
-app.get("/debug", (req, res) => {
-  res.json({ sessions: Object.keys(sessions), phones: connectedPhones, status: connectionStatus });
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', connections: connections.size });
 });
 
-app.get("/health", (req, res) => res.send("OK"));
+// Restore all active sessions on startup
+async function restoreActiveSessions() {
+  console.log('Restoring active sessions...');
+  const result = await callEdgeFunction('list', {});
+  
+  if (result.success && result.profileIds) {
+    for (const profileId of result.profileIds) {
+      console.log(`Restoring session: ${profileId}`);
+      await initializeWhatsApp(profileId);
+      await new Promise(r => setTimeout(r, 2000)); // Stagger connections
+    }
+    console.log(`Restored ${result.profileIds.length} sessions`);
+  }
+}
 
-app.listen(8080, "0.0.0.0", () => console.log("WhatsApp Service running on port 8080"));
+app.listen(PORT, () => {
+  console.log(`WhatsApp Web Service running on port ${PORT}`);
+  restoreActiveSessions();
+});
