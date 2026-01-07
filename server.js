@@ -8,7 +8,7 @@ import {
   useMultiFileAuthState,
   DisconnectReason
 } from "@whiskeysockets/baileys";
- 
+
 const app = express();
 app.use(express.json());
 
@@ -23,7 +23,7 @@ const RECONNECT_DELAY = 5000;
 async function saveSessionToDatabase(profile, sessionData) {
   try {
     const supabaseUrl = process.env.SUPABASE_URL || 'https://hrshudfqrjyrgppkiaas.supabase.co';
-    const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imhyc2h1ZGZxcmp5cmdwcGtpYWFzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjAwNjk1NDQsImV4cCI6MjA3NTY0NTU0NH0.8e9qC2X5jHkboIR4FJJfPwN7twM-z1a1-aoDVvsJY0Y';
+    const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
     
     if (!supabaseKey) {
       console.log('No service role key, skipping session persistence');
@@ -112,6 +112,7 @@ async function createClient(profile, pairing = false) {
 
   sock.ev.on("creds.update", async () => {
     await saveCreds();
+    // Save session to database when credentials update
     try {
       const sessionFiles = fs.readdirSync(sessionPath);
       const sessionData = {};
@@ -152,7 +153,9 @@ async function createClient(profile, pairing = false) {
 
         if (response.ok) {
           const data = await response.json();
-          if (data.reply) {
+          if (data.skipped) {
+            console.log(`Message skipped (${data.reason}):`, from);
+          } else if (data.reply) {
             try {
               await sock.sendMessage(from, { text: data.reply });
               console.log(`Sent reply to ${from}`);
@@ -189,6 +192,7 @@ async function createClient(profile, pairing = false) {
       try {
         const phoneNumber = sock.user?.id?.split(':')[0] || sock.user?.id;
         if (phoneNumber) connectedPhones[profile] = phoneNumber;
+        // Save connected status to database
         await saveSessionToDatabase(profile, null);
       } catch (e) {
         console.error('Error on connection open:', e.message);
@@ -207,6 +211,7 @@ async function createClient(profile, pairing = false) {
         delete reconnectAttempts[profile];
         delete connectedPhones[profile];
         delete connectionStatus[profile];
+        // Update database status
         await saveSessionToDatabase(profile, null);
         return;
       }
@@ -223,6 +228,7 @@ async function createClient(profile, pairing = false) {
   return sock;
 }
 
+// Initialize endpoint - accepts both 'profile' and 'profileId' for compatibility
 app.post("/init", async (req, res) => {
   try {
     const profile = req.body.profile || req.body.profileId;
@@ -239,6 +245,7 @@ app.post("/init", async (req, res) => {
 
     await createClient(profile, pairing === true);
     
+    // If phone number provided, request pairing code
     if (pairing && phoneNumber) {
       const sock = sessions[profile];
       if (sock) {
@@ -258,6 +265,7 @@ app.post("/init", async (req, res) => {
   }
 });
 
+// Pairing endpoint
 app.post("/pairing", async (req, res) => {
   try {
     const profile = req.body.profile || req.body.profileId;
@@ -277,6 +285,7 @@ app.post("/pairing", async (req, res) => {
   }
 });
 
+// QR endpoint - accepts both 'profile' and 'profileId' for compatibility
 app.get("/qr", async (req, res) => {
   const profile = req.query.profile || req.query.profileId;
   if (!profile) return res.status(400).json({ error: "profile required" });
@@ -292,6 +301,7 @@ app.get("/qr", async (req, res) => {
   return res.status(404).json({ error: "QR not ready" });
 });
 
+// Status endpoint - accepts both 'profile' and 'profileId' for compatibility
 app.get("/status", (req, res) => {
   const profile = req.query.profile || req.query.profileId;
   if (!profile) return res.status(400).json({ error: "profile required" });
@@ -311,6 +321,7 @@ app.get("/status", (req, res) => {
   });
 });
 
+// Send message endpoint
 app.post("/send-message", async (req, res) => {
   try {
     const profile = req.body.profile || req.body.profileId;
@@ -336,6 +347,7 @@ app.post("/send-message", async (req, res) => {
   }
 });
 
+// Disconnect endpoint - accepts both 'profile' and 'profileId' for compatibility
 app.post("/disconnect", async (req, res) => {
   const profile = req.body.profile || req.body.profileId;
   if (!profile) return res.status(400).json({ error: "profile required" });
@@ -349,6 +361,7 @@ app.post("/disconnect", async (req, res) => {
   delete connectedPhones[profile];
   connectionStatus[profile] = "disconnected";
   
+  // Update database
   await saveSessionToDatabase(profile, null);
   
   const sp = `./sessions/${profile}`;
@@ -358,13 +371,17 @@ app.post("/disconnect", async (req, res) => {
   return res.json({ success: true });
 });
 
+// Debug endpoint
 app.get("/debug", (req, res) => {
   res.json({ sessions: Object.keys(sessions), phones: connectedPhones, status: connectionStatus });
 });
 
+// Health check
 app.get("/health", (req, res) => res.send("OK"));
 
+// Start server and restore sessions
 app.listen(8080, "0.0.0.0", () => {
   console.log("WhatsApp Service running on port 8080");
+  // Restore sessions from database after startup
   setTimeout(restoreSessionsFromDatabase, 3000);
 });
