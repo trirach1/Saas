@@ -20,17 +20,12 @@ const connectionStatus = {};
 const MAX_RECONNECT_ATTEMPTS = 3;
 const RECONNECT_DELAY = 5000;
 
-const SUPABASE_URL = 'https://hrshudfqrjyrgppkiaas.supabase.co';
-const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imhyc2h1ZGZxcmp5cmdwcGtpYWFzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjAwNjk1NDQsImV4cCI6MjA3NTY0NTU0NH0.8e9qC2X5jHkboIR4FJJfPwN7twM-z1a1-aoDVvsJY0Y';
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://hrshudfqrjyrgppkiaas.supabase.co';
 
 // ============= DATABASE SESSION PERSISTENCE =============
 
 // Save session files to database
 async function saveSessionToDatabase(profile) {
-  if (!SUPABASE_KEY) {
-    console.log('[DB] No service role key, skipping session save');
-    return false;
-  }
 
   const sessionPath = `./sessions/${profile}`;
   if (!fs.existsSync(sessionPath)) {
@@ -86,11 +81,6 @@ async function saveSessionToDatabase(profile) {
 
 // Restore session files from database
 async function restoreSessionFromDatabase(profile) {
-  if (!SUPABASE_KEY) {
-    console.log('[DB] No service role key, skipping session restore');
-    return false;
-  }
-
   try {
     console.log('[DB] Attempting to restore session:', profile);
 
@@ -148,11 +138,6 @@ async function restoreSessionFromDatabase(profile) {
 
 // Get list of profiles to restore
 async function getProfilesToRestore() {
-  if (!SUPABASE_KEY) {
-    console.log('[DB] No service role key, skipping profile list');
-    return [];
-  }
-
   try {
     const response = await fetch(`${SUPABASE_URL}/functions/v1/whatsapp-session-persist`, {
       method: 'POST',
@@ -173,8 +158,6 @@ async function getProfilesToRestore() {
 
 // Mark session as disconnected in database
 async function markSessionDisconnected(profile) {
-  if (!SUPABASE_KEY) return;
-
   try {
     await fetch(`${SUPABASE_URL}/functions/v1/whatsapp-session-persist`, {
       method: 'POST',
