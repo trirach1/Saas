@@ -17,16 +17,17 @@ const sessions = {};
 const reconnectAttempts = {};
 const connectedPhones = {};
 const connectionStatus = {};
-const MAX_RECONNECT_ATTEMPTS = 3;
-const RECONNECT_DELAY = 5000;
+const keepaliveIntervals = {};
+const MAX_RECONNECT_ATTEMPTS = 15;
+const RECONNECT_DELAY = 3000;
+const KEEPALIVE_INTERVAL = 45000;
+const HEALTH_CHECK_INTERVAL = 5 * 60 * 1000;
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://hrshudfqrjyrgppkiaas.supabase.co';
 
 // ============= DATABASE SESSION PERSISTENCE =============
 
-// Save session files to database
 async function saveSessionToDatabase(profile) {
-
   const sessionPath = `./sessions/${profile}`;
   if (!fs.existsSync(sessionPath)) {
     console.log('[DB] No session folder to save:', profile);
@@ -34,7 +35,6 @@ async function saveSessionToDatabase(profile) {
   }
 
   try {
-    // Read all session files and encode them
     const sessionData = {};
     const files = fs.readdirSync(sessionPath);
     
@@ -54,7 +54,6 @@ async function saveSessionToDatabase(profile) {
 
     console.log(`[DB] Saving ${Object.keys(sessionData).length} session files for:`, profile);
 
-    // Call edge function to persist session
     const response = await fetch(`${SUPABASE_URL}/functions/v1/whatsapp-session-persist`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -79,12 +78,10 @@ async function saveSessionToDatabase(profile) {
   }
 }
 
-// Restore session files from database
 async function restoreSessionFromDatabase(profile) {
   try {
     console.log('[DB] Attempting to restore session:', profile);
 
-    // Call edge function to get session
     const response = await fetch(`${SUPABASE_URL}/functions/v1/whatsapp-session-persist`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -106,7 +103,6 @@ async function restoreSessionFromDatabase(profile) {
       return false;
     }
 
-    // Write session files to disk
     const sessionPath = `./sessions/${profile}`;
     if (!fs.existsSync(sessionPath)) {
       fs.mkdirSync(sessionPath, { recursive: true });
@@ -136,7 +132,6 @@ async function restoreSessionFromDatabase(profile) {
   }
 }
 
-// Get list of profiles to restore
 async function getProfilesToRestore() {
   try {
     const response = await fetch(`${SUPABASE_URL}/functions/v1/whatsapp-session-persist`, {
@@ -156,7 +151,6 @@ async function getProfilesToRestore() {
   }
 }
 
-// Mark session as disconnected in database
 async function markSessionDisconnected(profile) {
   try {
     await fetch(`${SUPABASE_URL}/functions/v1/whatsapp-session-persist`, {
@@ -173,6 +167,73 @@ async function markSessionDisconnected(profile) {
   }
 }
 
+// ============= KEEPALIVE & HEALTH =============
+
+function startKeepalive(profile) {
+  stopKeepalive(profile);
+  keepaliveIntervals[profile] = setInterval(async () => {
+    const sock = sessions[profile];
+    if (sock && connectionStatus[profile] === 'open') {
+      try {
+        await sock.sendPresenceUpdate('available');
+        console.log(`[KA] ♥ keepalive sent: ${profile}`);
+      } catch (e) {
+        console.warn(`[KA] keepalive failed: ${profile}`, e.message);
+      }
+    }
+  }, KEEPALIVE_INTERVAL);
+  console.log(`[KA] Started keepalive for: ${profile}`);
+}
+
+function stopKeepalive(profile) {
+  if (keepaliveIntervals[profile]) {
+    clearInterval(keepaliveIntervals[profile]);
+    delete keepaliveIntervals[profile];
+    console.log(`[KA] Stopped keepalive for: ${profile}`);
+  }
+}
+
+async function runHealthCheck() {
+  console.log('[HEALTH] Running session health check...');
+  const profiles = Object.keys(sessions);
+  
+  for (const profile of profiles) {
+    const sock = sessions[profile];
+    const status = connectionStatus[profile];
+    
+    if (status !== 'open' && sock) {
+      console.log(`[HEALTH] Session ${profile} is ${status}, attempting reconnect...`);
+      try {
+        try { sock.end(); } catch (e) {}
+        delete sessions[profile];
+        reconnectAttempts[profile] = 0;
+        await createClient(profile, false, true);
+      } catch (e) {
+        console.error(`[HEALTH] Reconnect failed for ${profile}:`, e.message);
+      }
+    }
+  }
+  
+  try {
+    const dbProfiles = await getProfilesToRestore();
+    for (const profileId of dbProfiles) {
+      if (!sessions[profileId]) {
+        console.log(`[HEALTH] Found orphaned DB session, restoring: ${profileId}`);
+        try {
+          await createClient(profileId, false, true);
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        } catch (e) {
+          console.error(`[HEALTH] Failed to restore orphaned session: ${profileId}`, e.message);
+        }
+      }
+    }
+  } catch (e) {
+    console.error('[HEALTH] Error checking DB sessions:', e.message);
+  }
+  
+  console.log('[HEALTH] Health check complete');
+}
+
 // ============= WHATSAPP CLIENT MANAGEMENT =============
 
 async function createClient(profile, pairing = false, isRestore = false) {
@@ -180,7 +241,6 @@ async function createClient(profile, pairing = false, isRestore = false) {
 
   const sessionPath = `./sessions/${profile}`;
   
-  // If restoring, try to get session from database first
   if (isRestore) {
     const restored = await restoreSessionFromDatabase(profile);
     if (!restored) {
@@ -190,7 +250,6 @@ async function createClient(profile, pairing = false, isRestore = false) {
     }
   }
 
-  // Ensure session directory exists
   if (!fs.existsSync(sessionPath)) {
     fs.mkdirSync(sessionPath, { recursive: true });
   }
@@ -205,7 +264,6 @@ async function createClient(profile, pairing = false, isRestore = false) {
     syncFullHistory: false,
     browser: pairing ? ["Android", "Chrome", "2.0"] : ["Web", "Chrome", "1.0"],
     mobile: false,
-    // Add connection timeout
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000,
   });
@@ -213,14 +271,11 @@ async function createClient(profile, pairing = false, isRestore = false) {
   sock.lastQR = null;
   sock.lastPairingCode = null;
 
-  // Save credentials when updated
   sock.ev.on("creds.update", async () => {
     await saveCreds();
-    // Persist to database after saving locally
     await saveSessionToDatabase(profile);
   });
 
-  // Handle incoming messages
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     console.log("[WA] Messages received:", type, "count:", messages.length);
     
@@ -266,7 +321,6 @@ async function createClient(profile, pairing = false, isRestore = false) {
     }
   });
 
-  // Handle connection updates
   sock.ev.on("connection.update", async (update) => {
     const { qr, connection, lastDisconnect, pairingCode } = update;
 
@@ -287,13 +341,14 @@ async function createClient(profile, pairing = false, isRestore = false) {
       reconnectAttempts[profile] = 0;
       connectionStatus[profile] = "open";
       
+      startKeepalive(profile);
+      
       try {
         const phoneNumber = sock.user?.id?.split(':')[0] || sock.user?.id;
         if (phoneNumber) {
           connectedPhones[profile] = phoneNumber;
           console.log("[WA] Phone number:", phoneNumber);
         }
-        // Save connected status to database
         await saveSessionToDatabase(profile);
       } catch (e) {
         console.error('[WA] Error on connection open:', e.message);
@@ -305,9 +360,9 @@ async function createClient(profile, pairing = false, isRestore = false) {
       console.log("[WA] Disconnected:", profile, "reason:", reason);
       connectionStatus[profile] = "closed";
 
-      // Logged out or conflict - clear everything
       if (reason === DisconnectReason.loggedOut || reason === 428) {
         console.log("[WA] Session logged out, clearing:", profile);
+        stopKeepalive(profile);
         const sp = `./sessions/${profile}`;
         if (fs.existsSync(sp)) fs.rmSync(sp, { recursive: true, force: true });
         delete sessions[profile];
@@ -318,18 +373,17 @@ async function createClient(profile, pairing = false, isRestore = false) {
         return;
       }
 
-      // Attempt reconnection with backoff
+      stopKeepalive(profile);
       if (!reconnectAttempts[profile]) reconnectAttempts[profile] = 0;
       
       if (reconnectAttempts[profile] >= MAX_RECONNECT_ATTEMPTS) {
-        console.log("[WA] Max reconnect attempts reached:", profile);
-        await markSessionDisconnected(profile);
+        console.log("[WA] Max reconnect attempts reached, will retry via health check:", profile);
         return;
       }
 
       reconnectAttempts[profile]++;
-      const delay = RECONNECT_DELAY * reconnectAttempts[profile];
-      console.log(`[WA] Reconnecting in ${delay}ms (attempt ${reconnectAttempts[profile]}/${MAX_RECONNECT_ATTEMPTS})`);
+      const delay = Math.min(RECONNECT_DELAY * Math.pow(1.5, reconnectAttempts[profile] - 1), 60000);
+      console.log(`[WA] Reconnecting in ${Math.round(delay/1000)}s (attempt ${reconnectAttempts[profile]}/${MAX_RECONNECT_ATTEMPTS})`);
       
       setTimeout(() => createClient(profile, pairing, false), delay);
     }
@@ -351,7 +405,6 @@ async function restoreAllSessions() {
     try {
       console.log('[STARTUP] Restoring session:', profileId);
       await createClient(profileId, false, true);
-      // Small delay between restorations to avoid overwhelming
       await new Promise(resolve => setTimeout(resolve, 2000));
     } catch (error) {
       console.error('[STARTUP] Failed to restore session:', profileId, error.message);
@@ -363,7 +416,6 @@ async function restoreAllSessions() {
 
 // ============= EXPRESS ENDPOINTS =============
 
-// Initialize endpoint - accepts both 'profile' and 'profileId' for compatibility
 app.post("/init", async (req, res) => {
   try {
     const profile = req.body.profile || req.body.profileId;
@@ -374,19 +426,16 @@ app.post("/init", async (req, res) => {
 
     console.log('[API] Init request:', profile, 'pairing:', pairing);
 
-    // Clean up existing session
     if (sessions[profile]) {
       try { sessions[profile].end(); } catch (e) {}
       delete sessions[profile];
     }
     reconnectAttempts[profile] = 0;
 
-    // Try to restore from database first
     const restored = await restoreSessionFromDatabase(profile);
     
     await createClient(profile, pairing === true, false);
     
-    // If phone number provided, request pairing code
     if (pairing && phoneNumber) {
       const sock = sessions[profile];
       if (sock) {
@@ -413,7 +462,6 @@ app.post("/init", async (req, res) => {
   }
 });
 
-// Pairing endpoint
 app.post("/pairing", async (req, res) => {
   try {
     const profile = req.body.profile || req.body.profileId;
@@ -434,7 +482,6 @@ app.post("/pairing", async (req, res) => {
   }
 });
 
-// QR endpoint
 app.get("/qr", async (req, res) => {
   const profile = req.query.profile || req.query.profileId;
   if (!profile) return res.status(400).json({ error: "profile required" });
@@ -450,7 +497,6 @@ app.get("/qr", async (req, res) => {
   return res.status(404).json({ error: "QR not ready" });
 });
 
-// Status endpoint
 app.get("/status", (req, res) => {
   const profile = req.query.profile || req.query.profileId;
   if (!profile) return res.status(400).json({ error: "profile required" });
@@ -470,7 +516,6 @@ app.get("/status", (req, res) => {
   });
 });
 
-// Send message endpoint
 app.post("/send-message", async (req, res) => {
   try {
     const profile = req.body.profile || req.body.profileId;
@@ -482,13 +527,11 @@ app.post("/send-message", async (req, res) => {
 
     let sock = sessions[profile];
     
-    // If no session, try to restore and create
     if (!sock) {
       console.log('[API] No session for send-message, attempting restore:', profile);
       const restored = await restoreSessionFromDatabase(profile);
       if (restored) {
         sock = await createClient(profile, false, false);
-        // Wait a bit for connection
         await new Promise(resolve => setTimeout(resolve, 3000));
       }
       
@@ -511,13 +554,13 @@ app.post("/send-message", async (req, res) => {
   }
 });
 
-// Disconnect endpoint
 app.post("/disconnect", async (req, res) => {
   const profile = req.body.profile || req.body.profileId;
   if (!profile) return res.status(400).json({ error: "profile required" });
   
   console.log('[API] Disconnect request:', profile);
 
+  stopKeepalive(profile);
   const sock = sessions[profile];
   if (sock) {
     try { sock.end(); } catch (e) {}
@@ -527,10 +570,8 @@ app.post("/disconnect", async (req, res) => {
   delete connectedPhones[profile];
   connectionStatus[profile] = "disconnected";
   
-  // Clear database session
   await markSessionDisconnected(profile);
   
-  // Clear local session files
   const sp = `./sessions/${profile}`;
   if (fs.existsSync(sp)) fs.rmSync(sp, { recursive: true, force: true });
   
@@ -538,7 +579,6 @@ app.post("/disconnect", async (req, res) => {
   return res.json({ success: true });
 });
 
-// Debug endpoint
 app.get("/debug", (req, res) => {
   res.json({ 
     sessions: Object.keys(sessions), 
@@ -548,7 +588,6 @@ app.get("/debug", (req, res) => {
   });
 });
 
-// Health check
 app.get("/health", (req, res) => res.send("OK"));
 
 // ============= START SERVER =============
@@ -559,6 +598,8 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`[SERVER] WhatsApp Service running on port ${PORT}`);
   console.log('[SERVER] Starting session restoration in 5 seconds...');
   
-  // Restore sessions from database after startup
   setTimeout(restoreAllSessions, 5000);
+  
+  setInterval(runHealthCheck, HEALTH_CHECK_INTERVAL);
+  console.log(`[SERVER] Health check scheduled every ${HEALTH_CHECK_INTERVAL / 60000} minutes`);
 });
