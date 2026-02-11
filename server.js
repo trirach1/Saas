@@ -151,7 +151,25 @@ async function getProfilesToRestore() {
   }
 }
 
-async function markSessionDisconnected(profile) {
+// Mark session as temporarily disconnected - KEEPS session data for auto-restore
+async function markSessionTemporarilyDisconnected(profile) {
+  try {
+    await fetch(`${SUPABASE_URL}/functions/v1/whatsapp-session-persist`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'mark_disconnected',
+        profileId: profile
+      })
+    });
+    console.log('[DB] Session marked temporarily disconnected (data preserved):', profile);
+  } catch (error) {
+    console.error('[DB] Error marking session temporarily disconnected:', error.message);
+  }
+}
+
+// Full delete - only for explicit user logout/disconnect
+async function fullDeleteSession(profile) {
   try {
     await fetch(`${SUPABASE_URL}/functions/v1/whatsapp-session-persist`, {
       method: 'POST',
@@ -161,9 +179,9 @@ async function markSessionDisconnected(profile) {
         profileId: profile
       })
     });
-    console.log('[DB] Session marked as disconnected:', profile);
+    console.log('[DB] Session fully deleted:', profile);
   } catch (error) {
-    console.error('[DB] Error marking session disconnected:', error.message);
+    console.error('[DB] Error deleting session:', error.message);
   }
 }
 
@@ -214,6 +232,7 @@ async function runHealthCheck() {
     }
   }
   
+  // Check database for sessions that should be connected but aren't in memory
   try {
     const dbProfiles = await getProfilesToRestore();
     for (const profileId of dbProfiles) {
@@ -244,8 +263,7 @@ async function createClient(profile, pairing = false, isRestore = false) {
   if (isRestore) {
     const restored = await restoreSessionFromDatabase(profile);
     if (!restored) {
-      console.log('[WA] Could not restore session, marking as disconnected:', profile);
-      await markSessionDisconnected(profile);
+      console.log('[WA] Could not restore session from DB:', profile);
       return null;
     }
   }
@@ -360,8 +378,9 @@ async function createClient(profile, pairing = false, isRestore = false) {
       console.log("[WA] Disconnected:", profile, "reason:", reason);
       connectionStatus[profile] = "closed";
 
+      // Logged out or conflict - FULL clear
       if (reason === DisconnectReason.loggedOut || reason === 428) {
-        console.log("[WA] Session logged out, clearing:", profile);
+        console.log("[WA] Session logged out, full clearing:", profile);
         stopKeepalive(profile);
         const sp = `./sessions/${profile}`;
         if (fs.existsSync(sp)) fs.rmSync(sp, { recursive: true, force: true });
@@ -369,11 +388,15 @@ async function createClient(profile, pairing = false, isRestore = false) {
         delete reconnectAttempts[profile];
         delete connectedPhones[profile];
         delete connectionStatus[profile];
-        await markSessionDisconnected(profile);
+        await fullDeleteSession(profile);
         return;
       }
 
+      // TEMPORARY disconnect - preserve session data!
       stopKeepalive(profile);
+      await saveSessionToDatabase(profile);
+      await markSessionTemporarilyDisconnected(profile);
+      
       if (!reconnectAttempts[profile]) reconnectAttempts[profile] = 0;
       
       if (reconnectAttempts[profile] >= MAX_RECONNECT_ATTEMPTS) {
@@ -554,11 +577,12 @@ app.post("/send-message", async (req, res) => {
   }
 });
 
+// EXPLICIT user disconnect - full delete
 app.post("/disconnect", async (req, res) => {
   const profile = req.body.profile || req.body.profileId;
   if (!profile) return res.status(400).json({ error: "profile required" });
   
-  console.log('[API] Disconnect request:', profile);
+  console.log('[API] Disconnect request (user-initiated):', profile);
 
   stopKeepalive(profile);
   const sock = sessions[profile];
@@ -570,7 +594,7 @@ app.post("/disconnect", async (req, res) => {
   delete connectedPhones[profile];
   connectionStatus[profile] = "disconnected";
   
-  await markSessionDisconnected(profile);
+  await fullDeleteSession(profile);
   
   const sp = `./sessions/${profile}`;
   if (fs.existsSync(sp)) fs.rmSync(sp, { recursive: true, force: true });
