@@ -151,7 +151,6 @@ async function getProfilesToRestore() {
   }
 }
 
-// Mark session as temporarily disconnected - KEEPS session data for auto-restore
 async function markSessionTemporarilyDisconnected(profile) {
   try {
     await fetch(`${SUPABASE_URL}/functions/v1/whatsapp-session-persist`, {
@@ -168,7 +167,6 @@ async function markSessionTemporarilyDisconnected(profile) {
   }
 }
 
-// Full delete - only for explicit user logout/disconnect
 async function fullDeleteSession(profile) {
   try {
     await fetch(`${SUPABASE_URL}/functions/v1/whatsapp-session-persist`, {
@@ -232,7 +230,6 @@ async function runHealthCheck() {
     }
   }
   
-  // Check database for sessions that should be connected but aren't in memory
   try {
     const dbProfiles = await getProfilesToRestore();
     for (const profileId of dbProfiles) {
@@ -378,7 +375,6 @@ async function createClient(profile, pairing = false, isRestore = false) {
       console.log("[WA] Disconnected:", profile, "reason:", reason);
       connectionStatus[profile] = "closed";
 
-      // Logged out or conflict - FULL clear
       if (reason === DisconnectReason.loggedOut || reason === 428) {
         console.log("[WA] Session logged out, full clearing:", profile);
         stopKeepalive(profile);
@@ -392,7 +388,6 @@ async function createClient(profile, pairing = false, isRestore = false) {
         return;
       }
 
-      // TEMPORARY disconnect - preserve session data!
       stopKeepalive(profile);
       await saveSessionToDatabase(profile);
       await markSessionTemporarilyDisconnected(profile);
@@ -577,7 +572,6 @@ app.post("/send-message", async (req, res) => {
   }
 });
 
-// EXPLICIT user disconnect - full delete
 app.post("/disconnect", async (req, res) => {
   const profile = req.body.profile || req.body.profileId;
   if (!profile) return res.status(400).json({ error: "profile required" });
