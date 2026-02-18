@@ -22,6 +22,8 @@ const MAX_RECONNECT_ATTEMPTS = 15;
 const RECONNECT_DELAY = 3000;
 const KEEPALIVE_INTERVAL = 45000;
 const HEALTH_CHECK_INTERVAL = 5 * 60 * 1000;
+const SESSION_SAVE_INTERVAL = 2 * 60 * 1000;
+const sessionSaveIntervals = {};
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://hrshudfqrjyrgppkiaas.supabase.co';
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imhyc2h1ZGZxcmp5cmdwcGtpYWFzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjAwNjk1NDQsImV4cCI6MjA3NTY0NTU0NH0.8e9qC5X5jHkboIR4FJJfPwN7twM-z1a1-aoDVvsJY0Y';
@@ -158,7 +160,6 @@ async function getProfilesToRestore() {
   }
 }
 
-// Mark session as temporarily disconnected - KEEPS session data for auto-restore
 async function markSessionTemporarilyDisconnected(profile) {
   try {
     await fetch(`${SUPABASE_URL}/functions/v1/whatsapp-session-persist`, {
@@ -175,7 +176,6 @@ async function markSessionTemporarilyDisconnected(profile) {
   }
 }
 
-// Full delete - only for explicit user logout/disconnect
 async function fullDeleteSession(profile) {
   try {
     await fetch(`${SUPABASE_URL}/functions/v1/whatsapp-session-persist`, {
@@ -239,7 +239,6 @@ async function runHealthCheck() {
     }
   }
   
-  // Check database for sessions that should be connected but aren't in memory
   try {
     const dbProfiles = await getProfilesToRestore();
     for (const profileId of dbProfiles) {
@@ -267,7 +266,6 @@ async function createClient(profile, pairing = false, isRestore = false) {
 
   const sessionPath = `./sessions/${profile}`;
   
-  // If restoring, try to get session from database first
   if (isRestore) {
     const restored = await restoreSessionFromDatabase(profile);
     if (!restored) {
@@ -301,6 +299,14 @@ async function createClient(profile, pairing = false, isRestore = false) {
     await saveCreds();
     await saveSessionToDatabase(profile);
   });
+
+  if (sessionSaveIntervals[profile]) clearInterval(sessionSaveIntervals[profile]);
+  sessionSaveIntervals[profile] = setInterval(async () => {
+    if (connectionStatus[profile] === 'open') {
+      console.log(`[DB] Periodic save for: ${profile}`);
+      await saveSessionToDatabase(profile);
+    }
+  }, SESSION_SAVE_INTERVAL);
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     console.log("[WA] Messages received:", type, "count:", messages.length);
@@ -386,9 +392,10 @@ async function createClient(profile, pairing = false, isRestore = false) {
       console.log("[WA] Disconnected:", profile, "reason:", reason);
       connectionStatus[profile] = "closed";
 
-      if (reason === DisconnectReason.loggedOut || reason === 428) {
-        console.log("[WA] Session logged out, full clearing:", profile);
+      if (reason === DisconnectReason.loggedOut) {
+        console.log("[WA] Session explicitly logged out, full clearing:", profile);
         stopKeepalive(profile);
+        if (sessionSaveIntervals[profile]) { clearInterval(sessionSaveIntervals[profile]); delete sessionSaveIntervals[profile]; }
         const sp = `./sessions/${profile}`;
         if (fs.existsSync(sp)) fs.rmSync(sp, { recursive: true, force: true });
         delete sessions[profile];
@@ -399,7 +406,12 @@ async function createClient(profile, pairing = false, isRestore = false) {
         return;
       }
 
+      if (reason === 428) {
+        console.log("[WA] Connection conflict (428), treating as temporary:", profile);
+      }
+
       stopKeepalive(profile);
+      
       await saveSessionToDatabase(profile);
       await markSessionTemporarilyDisconnected(profile);
       
@@ -583,7 +595,6 @@ app.post("/send-message", async (req, res) => {
   }
 });
 
-// EXPLICIT user disconnect - full delete
 app.post("/disconnect", async (req, res) => {
   const profile = req.body.profile || req.body.profileId;
   if (!profile) return res.status(400).json({ error: "profile required" });
@@ -591,6 +602,7 @@ app.post("/disconnect", async (req, res) => {
   console.log('[API] Disconnect request (user-initiated):', profile);
 
   stopKeepalive(profile);
+  if (sessionSaveIntervals[profile]) { clearInterval(sessionSaveIntervals[profile]); delete sessionSaveIntervals[profile]; }
   const sock = sessions[profile];
   if (sock) {
     try { sock.end(); } catch (e) {}
@@ -600,7 +612,6 @@ app.post("/disconnect", async (req, res) => {
   delete connectedPhones[profile];
   connectionStatus[profile] = "disconnected";
   
-  // FULL delete - user explicitly disconnected
   await fullDeleteSession(profile);
   
   const sp = `./sessions/${profile}`;
